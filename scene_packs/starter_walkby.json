@@ -1,0 +1,22 @@
+{
+  "name": "starter_walkby",
+  "version": 1,
+  "description": "Starter controlled scenes for dSense v0 walk-by and room perturbation capture.",
+  "scenes": [
+    {"label": "empty_room_control", "instruction": "Leave the room empty and keep the computer idle."},
+    {"label": "baseline_idle", "instruction": "Sit away from the machine; avoid intentional movement."},
+    {"label": "person_walks_front_left_to_right", "instruction": "Walk across the front of the computer from left to right during the action window."},
+    {"label": "person_walks_front_right_to_left", "instruction": "Walk across the front of the computer from right to left during the action window."},
+    {"label": "person_approaches_front", "instruction": "Approach the computer from the front and stop near it."},
+    {"label": "person_departs_front", "instruction": "Start near the computer and depart to the front."},
+    {"label": "person_walks_behind_left_to_right", "instruction": "Walk behind the computer from left to right."},
+    {"label": "person_walks_behind_right_to_left", "instruction": "Walk behind the computer from right to left."},
+    {"label": "person_stands_left_side", "instruction": "Stand near the left side through the action window."},
+    {"label": "person_stands_right_side", "instruction": "Stand near the right side through the action window."},
+    {"label": "phone_passes_near_computer", "instruction": "Move a phone near the computer without touching it."},
+    {"label": "door_open_close", "instruction": "Open and close a nearby door once."},
+    {"label": "chair_moved", "instruction": "Move a nearby chair during the action window."},
+    {"label": "fan_hvac_change", "instruction": "Change a fan or HVAC state if safe and allowed."},
+    {"label": "cpu_load_no_person", "instruction": "Run CPU load without a person moving near the machine."}
+  ]
+}
