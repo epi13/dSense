@@ -6,6 +6,7 @@ from .manifest import init_project, scan_channels, project_path, load_manifest, 
 from .recorder import record_scene
 from .wizard import guided_scene
 from .utils.files import read_json
+from .autotest import validate_dataset, print_validation_report
 
 
 def cmd_init(args):
@@ -54,6 +55,12 @@ def cmd_export(args):
     print(f"Wrote {out}")
 
 
+def cmd_validate(args):
+    """Validate all scenes in a project and print a detailed report."""
+    result = validate_dataset(args.project_name)
+    print_validation_report(result, verbose=args.verbose)
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="dsense", description="dSense Scene Wizard")
     sub = p.add_subparsers(required=True)
@@ -63,6 +70,7 @@ def build_parser():
     sp = sub.add_parser("scene"); sp.add_argument("project_name"); sp.add_argument("--label", required=True); sp.add_argument("--duration", type=float); sp.add_argument("--pre-roll", type=float, default=2); sp.add_argument("--action", type=float, default=5); sp.add_argument("--post-roll", type=float, default=3); sp.add_argument("--repeat", type=int, default=1); sp.add_argument("--notes", default=""); sp.add_argument("--tick-hz", type=int, default=100); sp.add_argument("--yes", action="store_true", help="accept captures without prompt"); sp.set_defaults(func=cmd_scene)
     sp = sub.add_parser("list-scenes"); sp.add_argument("project_name"); sp.set_defaults(func=cmd_list)
     sp = sub.add_parser("export-preview"); sp.add_argument("project_name"); sp.set_defaults(func=cmd_export)
+    sp = sub.add_parser("validate"); sp.add_argument("project_name"); sp.add_argument("--verbose", "-v", action="store_true", help="show detailed error messages"); sp.set_defaults(func=cmd_validate)
     return p
 
 
