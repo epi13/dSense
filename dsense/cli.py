@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-import argparse, csv, sys
+import argparse, csv, json, sys
 from pathlib import Path
 from .baseline import train_and_save_project_baseline
-from .classifier import train_and_save_project_classifier
+from .classifier import load_project_classifier, predict_scene, train_and_save_project_classifier
 from .gemma_edge import gemma_edge_status
+from .frame import FRAME_SIZE, frame_to_dict
 from .manifest import DEFAULT_PROJECT, init_project, scan_channels, project_path, load_manifest, allocate_scene_id
+from .models.evaluation import evaluate_project_scenes, evaluation_report_path, print_evaluation_report
 from .recorder import record_scene
 from .tui import CaptureConfig, run_tui
 from .wizard import guided_scene
@@ -99,6 +101,7 @@ def cmd_validate(args):
 def cmd_train_classifier(args):
     project_name = args.project_name or DEFAULT_PROJECT
     init_project(project_name)
+    _require_valid_dataset(project_name, args.require_valid)
     model = train_and_save_project_classifier(project_name)
     print(f"Trained classifier for {project_name}: {model.scene_count} scenes, {model.baseline_scene_count} baseline scenes")
     print(project_path(project_name) / "exports" / "classifier.json")
@@ -107,6 +110,7 @@ def cmd_train_classifier(args):
 def cmd_train_baseline(args):
     project_name = args.project_name or DEFAULT_PROJECT
     init_project(project_name)
+    _require_valid_dataset(project_name, args.require_valid)
     model = train_and_save_project_baseline(project_name)
     print(f"Trained baseline for {project_name}: {model.scene_count} baseline scenes, {len(model.channels)} channels")
     print(project_path(project_name) / "exports" / "baseline_model.json")
@@ -115,9 +119,69 @@ def cmd_train_baseline(args):
 def cmd_export_transfer(args):
     project_name = args.project_name or DEFAULT_PROJECT
     init_project(project_name)
+    _require_valid_dataset(project_name, args.require_valid)
     bundle = export_transfer_bundle(project_name)
     print(f"Exported transfer bundle for {project_name}: {bundle['total_scenes']} scenes")
     print(transfer_bundle_path(project_name))
+
+
+def cmd_evaluate_scenes(args):
+    project_name = args.project_name or DEFAULT_PROJECT
+    init_project(project_name)
+    report = evaluate_project_scenes(project_name)
+    print_evaluation_report(report)
+    print(evaluation_report_path(project_name))
+
+
+def cmd_classify_scene(args):
+    scene_dir = Path(args.scene_dir)
+    preview_path = scene_dir / "preview.csv"
+    if not preview_path.exists():
+        raise SystemExit(f"Missing preview.csv in {scene_dir}")
+    model = load_project_classifier(args.project)
+    result = predict_scene(model, preview_path)
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def cmd_inspect_frame(args):
+    scene_dir = Path(args.scene_dir)
+    frames_path = scene_dir / "frames.ds64"
+    if not frames_path.exists():
+        raise SystemExit(f"Missing frames.ds64 in {scene_dir}")
+    offset = args.tick * FRAME_SIZE
+    with frames_path.open("rb") as handle:
+        handle.seek(offset)
+        frame = handle.read(FRAME_SIZE)
+    if len(frame) != FRAME_SIZE:
+        raise SystemExit(f"Tick {args.tick} is outside {frames_path}")
+    result: dict[str, object] = {"frame": frame_to_dict(frame)}
+    preview_row = _preview_row(scene_dir / "preview.csv", args.tick)
+    if preview_row is not None:
+        result["preview"] = preview_row
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def cmd_replay(args):
+    scene_dir = Path(args.scene_dir)
+    scene_path = scene_dir / "scene.json"
+    preview_path = scene_dir / "preview.csv"
+    events_path = scene_dir / "events.jsonl"
+    if not scene_path.exists() or not preview_path.exists():
+        raise SystemExit(f"Scene must contain scene.json and preview.csv: {scene_dir}")
+    scene = read_json(scene_path)
+    rows = _preview_rows(preview_path)
+    events = _event_rows(events_path)
+    print(f"Replay {scene.get('scene_id', scene_dir.name)} label={scene.get('label', 'unknown')} rows={len(rows)} events={len(events)}")
+    if events:
+        print("Events:")
+        for event in events:
+            print(f"  {event.get('t_ms', '?')}ms {event.get('event', 'unknown')}")
+    if rows:
+        print("Preview:")
+        for row in rows[: args.limit]:
+            print(f"  tick={row.get('tick')} t_ns={row.get('t_ns')} dt_ns={row.get('dt_ns')} sleep_drift_ns={row.get('sleep_drift_ns')} process_ns_estimate={row.get('process_ns_estimate')}")
+        if len(rows) > args.limit:
+            print(f"  ... {len(rows) - args.limit} more rows")
 
 
 def cmd_compare_transfer(args):
@@ -145,6 +209,46 @@ def cmd_gemma_status(args):
     print(f"Mode: {status['mode']}")
 
 
+def _require_valid_dataset(project_name: str, require_valid: bool) -> None:
+    if not require_valid:
+        return
+    result = validate_dataset(project_name)
+    if result.error_count:
+        print_validation_report(result, verbose=True)
+        raise SystemExit(f"Validation failed for {project_name}: {result.error_count} errors")
+
+
+def _preview_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def _preview_row(path: Path, tick: int) -> dict[str, str] | None:
+    for row in _preview_rows(path):
+        try:
+            if int(row.get("tick", -1)) == tick:
+                return row
+        except ValueError:
+            continue
+    return None
+
+
+def _event_rows(path: Path) -> list[dict[str, object]]:
+    if not path.exists():
+        return []
+    events = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return events
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="dsense", description="dSense Scene Wizard")
     sub = p.add_subparsers(required=True)
@@ -157,8 +261,13 @@ def build_parser():
     sp = sub.add_parser("export-preview"); sp.add_argument("project_name"); sp.set_defaults(func=cmd_export)
     sp = sub.add_parser("validate"); sp.add_argument("project_name"); sp.add_argument("--verbose", "-v", action="store_true", help="show detailed error messages"); sp.set_defaults(func=cmd_validate)
     sp = sub.add_parser("train-baseline"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to train (default: {DEFAULT_PROJECT})"); sp.set_defaults(func=cmd_train_baseline)
-    sp = sub.add_parser("train-classifier"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to train (default: {DEFAULT_PROJECT})"); sp.set_defaults(func=cmd_train_classifier)
-    sp = sub.add_parser("export-transfer"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to export (default: {DEFAULT_PROJECT})"); sp.set_defaults(func=cmd_export_transfer)
+    sp.add_argument("--require-valid", action="store_true", help="fail before training if dataset validation has errors")
+    sp = sub.add_parser("train-classifier"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to train (default: {DEFAULT_PROJECT})"); sp.add_argument("--require-valid", action="store_true", help="fail before training if dataset validation has errors"); sp.set_defaults(func=cmd_train_classifier)
+    sp = sub.add_parser("export-transfer"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to export (default: {DEFAULT_PROJECT})"); sp.add_argument("--require-valid", action="store_true", help="fail before export if dataset validation has errors"); sp.set_defaults(func=cmd_export_transfer)
+    sp = sub.add_parser("evaluate-scenes"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to evaluate (default: {DEFAULT_PROJECT})"); sp.set_defaults(func=cmd_evaluate_scenes)
+    sp = sub.add_parser("classify-scene"); sp.add_argument("scene_dir"); sp.add_argument("--project", default=DEFAULT_PROJECT, help=f"classifier project to use (default: {DEFAULT_PROJECT})"); sp.set_defaults(func=cmd_classify_scene)
+    sp = sub.add_parser("inspect-frame"); sp.add_argument("scene_dir"); sp.add_argument("--tick", type=int, required=True); sp.set_defaults(func=cmd_inspect_frame)
+    sp = sub.add_parser("replay"); sp.add_argument("scene_dir"); sp.add_argument("--limit", type=int, default=10, help="preview rows to print"); sp.set_defaults(func=cmd_replay)
     sp = sub.add_parser("compare-transfer"); sp.add_argument("project_or_bundle", help="project name or transfer bundle JSON path"); sp.add_argument("bundle", nargs="?", help="transfer bundle JSON path"); sp.set_defaults(func=cmd_compare_transfer)
     sp = sub.add_parser("gemma-status"); sp.set_defaults(func=cmd_gemma_status)
     return p

@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import csv
 from dataclasses import dataclass
 from pathlib import Path
-from statistics import median
 
 from .manifest import project_path
+from .models.features import full_profile, percentile, read_numeric_preview_rows
 from .utils.files import ensure_dir, read_json, write_json
 from .utils.timebase import utc_now_iso
 
@@ -36,7 +35,7 @@ def baseline_path(project_name: str) -> Path:
 
 def train_project_baseline(project_name: str, threshold: float = 6.0) -> BaselineModel:
     root = project_path(project_name)
-    values: dict[str, list[float]] = {channel: [] for channel in BASELINE_CHANNELS}
+    values: dict[str, list[float]] = {}
     scene_count = 0
     for scene_path in sorted((root / "scenes").glob("scene_*/scene.json")):
         try:
@@ -53,8 +52,8 @@ def train_project_baseline(project_name: str, threshold: float = 6.0) -> Baselin
             continue
         scene_count += 1
         for row in rows:
-            for channel in BASELINE_CHANNELS:
-                values[channel].append(abs(float(row.get(channel, 0.0))))
+            for channel, value in row.items():
+                values.setdefault(channel, []).append(abs(float(value)))
 
     channels = {
         channel: _profile(channel_values)
@@ -115,38 +114,12 @@ def score_against_baseline(values: dict[str, float], model: BaselineModel | None
 
 
 def _read_rows(path: Path) -> list[dict[str, float]]:
-    rows = []
-    with path.open(newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            parsed = {}
-            for channel in BASELINE_CHANNELS:
-                try:
-                    parsed[channel] = float(row.get(channel, 0) or 0)
-                except ValueError:
-                    parsed[channel] = 0.0
-            rows.append(parsed)
-    return rows
+    return read_numeric_preview_rows(path)
 
 
 def _profile(values: list[float]) -> dict[str, float]:
-    ordered = sorted(values)
-    center = median(ordered) if ordered else 0.0
-    deviations = [abs(value - center) for value in ordered]
-    mad = median(deviations) if deviations else 1.0
-    mad = mad or 1.0
-    return {
-        "center": float(center),
-        "mad": float(mad),
-        "p95": _percentile(ordered, 0.95),
-        "p99": _percentile(ordered, 0.99),
-        "min": float(ordered[0]) if ordered else 0.0,
-        "max": float(ordered[-1]) if ordered else 0.0,
-    }
+    return full_profile(values)
 
 
 def _percentile(ordered_values: list[float], quantile: float) -> float:
-    if not ordered_values:
-        return 0.0
-    idx = min(len(ordered_values) - 1, max(0, int(round((len(ordered_values) - 1) * quantile))))
-    return float(ordered_values[idx])
+    return percentile(ordered_values, quantile)

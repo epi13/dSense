@@ -68,6 +68,7 @@ python -m dsense tui --label person_walks_front_left_to_right --duration 10 --pr
 python -m dsense scene demo_lab --label person_walks_front_left_to_right --duration 10 --pre-roll 2 --action 5 --post-roll 3 --repeat 3
 python -m dsense train-baseline
 python -m dsense train-classifier
+python -m dsense evaluate-scenes
 python -m dsense export-transfer
 python -m dsense list-scenes demo_lab
 python -m dsense export-preview demo_lab
@@ -88,9 +89,31 @@ The TUI starts with an editable capture setup, shows detected channels, baseline
 The baseline model is stored at `datasets/<project_name>/exports/baseline_model.json`. The classifier is stored at `datasets/<project_name>/exports/classifier.json`. They use accepted scene previews to build baseline channel profiles and label summaries. They are retrained automatically when the TUI opens and after new accepted recordings are added, so automatic event detection improves as the project grows. You can retrain them explicitly with:
 
 ```bash
-python -m dsense train-baseline
-python -m dsense train-classifier
+python -m dsense train-baseline --require-valid
+python -m dsense train-classifier --require-valid
 ```
+
+## Phase 7 evaluation
+
+The main scientific checkpoint is repeatability: repeated takes of the same scene should look similar, and different labels should separate. Record repeated takes under stable labels, then run:
+
+```bash
+python -m dsense evaluate-scenes base
+python -m dsense classify-scene datasets/base/scenes/scene_000001
+python -m dsense inspect-frame datasets/base/scenes/scene_000001 --tick 50
+python -m dsense replay datasets/base/scenes/scene_000001
+```
+
+`evaluate-scenes` writes `datasets/<project_name>/exports/evaluation_report.json` and prints label counts, within-label similarity, between-label distance, a leave-one-out confusion matrix, baseline drift, and a channel usefulness ranking. Baseline and classifier training dynamically discover numeric preview columns, so extra channels such as `cpu_load_ppm`, `disk_stat_latency_ns`, `network_latency_ns`, `power_online`, and `battery_percent` can contribute when present.
+
+Recommended repeatability set:
+
+- `baseline_idle`
+- `typing_burst`
+- `mouse_activity`
+- `phone_near_computer`
+- `walk_by`
+- optional controls: `cpu_load_no_person`, `door_open_close`
 
 On the setup screen:
 
@@ -195,6 +218,7 @@ See `docs/frame-format.md` for the exact layout.
 - Phase 4: local always-on dSense Watcher — implemented as TUI-controlled watcher scans that save candidate scenes.
 - Phase 5: orbiters and AI integration — implemented as local JSONL orbiter summaries for downstream AI clients.
 - Phase 6: cross-machine and cross-room transfer tests — implemented as local transfer bundle export/compare.
+- Phase 7: repeatability and evaluation — implemented with dynamic preview features, evaluation reports, validation gates, and replay/debug commands.
 
 ## Privacy and safety
 
@@ -205,7 +229,7 @@ Substrate signals can become fingerprints of a machine, room, routine, or user b
 - universal first
 - graceful degradation
 - fixed frame format
-- record/replay/null modes eventually
+- record/replay/null modes for reproducibility
 - no overclaiming
 - labeled data before model complexity
 - boring tools before exotic probes

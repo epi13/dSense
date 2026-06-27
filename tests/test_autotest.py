@@ -158,6 +158,7 @@ def test_validate_dataset():
         # Mock the project_path to point to our test directory
         import dsense.manifest
         old_datasets = dsense.manifest.DATASETS
+        old_project_path = dsense.autotest.project_path
         dsense.manifest.DATASETS = tmpdir_path
         dsense.autotest.project_path = lambda name: tmpdir_path / name
         
@@ -171,6 +172,7 @@ def test_validate_dataset():
             assert result.comparison["total_frames"] == 4000  # 3000 + 1000
         finally:
             dsense.manifest.DATASETS = old_datasets
+            dsense.autotest.project_path = old_project_path
 
 
 def test_validate_dataset_mixed_quality():
@@ -194,6 +196,7 @@ def test_validate_dataset_mixed_quality():
         
         import dsense.manifest
         old_datasets = dsense.manifest.DATASETS
+        old_project_path = dsense.autotest.project_path
         dsense.manifest.DATASETS = tmpdir_path
         dsense.autotest.project_path = lambda name: tmpdir_path / name
         
@@ -205,3 +208,4 @@ def test_validate_dataset_mixed_quality():
             assert result.comparison["unique_labels"] == 1
         finally:
             dsense.manifest.DATASETS = old_datasets
+            dsense.autotest.project_path = old_project_path

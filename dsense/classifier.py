@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import csv
 from dataclasses import dataclass
 from pathlib import Path
-from statistics import median
 
 from .manifest import project_path
+from .models.evaluation import predict_from_profiles
+from .models.features import mean_profile, percentile, read_numeric_preview_rows, robust_profile, summarize_rows
 from .utils.files import ensure_dir, read_json, write_json
 from .utils.timebase import utc_now_iso
 
@@ -37,7 +37,7 @@ class SceneClassifierModel:
 def train_project_classifier(project_name: str) -> SceneClassifierModel:
     root = project_path(project_name)
     scene_rows: list[dict[str, object]] = []
-    baseline_rows: dict[str, list[float]] = {channel: [] for channel in CHANNELS}
+    baseline_rows: dict[str, list[float]] = {}
     label_counts: dict[str, int] = {}
     label_features: dict[str, list[dict[str, float]]] = {}
     baseline_scene_count = 0
@@ -67,11 +67,11 @@ def train_project_classifier(project_name: str) -> SceneClassifierModel:
         if label.startswith("baseline_"):
             baseline_scene_count += 1
             for row in rows:
-                for channel in CHANNELS:
-                    baseline_rows[channel].append(abs(float(row[channel])))
+                for channel, value in row.items():
+                    baseline_rows.setdefault(channel, []).append(abs(float(value)))
 
     detector_baseline = {
-        channel: _robust_profile(values)
+        channel: robust_profile(values)
         for channel, values in baseline_rows.items()
         if values
     }
@@ -131,23 +131,7 @@ def classifier_path(project_name: str) -> Path:
 def predict_features(model: SceneClassifierModel | None, features: dict[str, float]) -> dict[str, object]:
     if model is None or not model.label_profiles:
         return {"label": "unknown", "confidence": 0.0, "distance": 0.0, "contributions": {}}
-    distances = []
-    for label, profile in model.label_profiles.items():
-        shared = sorted(set(features) & set(profile))
-        if not shared:
-            continue
-        contributions = {
-            key: abs(float(features.get(key, 0.0)) - float(profile.get(key, 0.0))) / max(abs(float(profile.get(key, 0.0))), 1.0)
-            for key in shared
-        }
-        distance = sum(contributions.values()) / len(contributions)
-        distances.append((distance, label, contributions))
-    if not distances:
-        return {"label": "unknown", "confidence": 0.0, "distance": 0.0, "contributions": {}}
-    distance, label, contributions = min(distances, key=lambda item: (item[0], item[1]))
-    confidence = round(1.0 / (1.0 + distance), 3)
-    top_contrib = dict(sorted(contributions.items(), key=lambda item: item[1], reverse=True)[:5])
-    return {"label": label, "confidence": confidence, "distance": round(distance, 6), "contributions": top_contrib}
+    return predict_from_profiles(model.label_profiles, features)
 
 
 def predict_scene(model: SceneClassifierModel | None, preview_path: Path) -> dict[str, object]:
@@ -158,50 +142,20 @@ def predict_scene(model: SceneClassifierModel | None, preview_path: Path) -> dic
 
 
 def _read_preview_rows(path: Path) -> list[dict[str, float]]:
-    rows = []
-    with path.open(newline="", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            try:
-                rows.append({channel: float(row.get(channel, 0) or 0) for channel in CHANNELS})
-            except ValueError:
-                continue
-    return rows
+    return read_numeric_preview_rows(path)
 
 
 def _summarize_rows(rows: list[dict[str, float]]) -> dict[str, float]:
-    features: dict[str, float] = {}
-    for channel in CHANNELS:
-        values = [abs(float(row[channel])) for row in rows]
-        profile = _robust_profile(values)
-        features[f"{channel}_median"] = profile["center"]
-        features[f"{channel}_mad"] = profile["mad"]
-        features[f"{channel}_p95"] = _percentile(values, 0.95)
-    return features
+    return summarize_rows(rows)
 
 
 def _robust_profile(values: list[float]) -> dict[str, float]:
-    if not values:
-        return {"center": 0.0, "mad": 1.0}
-    center = median(values)
-    deviations = [abs(value - center) for value in values]
-    mad = median(deviations) or 1.0
-    return {"center": float(center), "mad": float(mad)}
+    return robust_profile(values)
 
 
 def _mean_profile(features: list[dict[str, float]]) -> dict[str, float]:
-    if not features:
-        return {}
-    keys = sorted({key for feature in features for key in feature})
-    return {
-        key: sum(feature.get(key, 0.0) for feature in features) / len(features)
-        for key in keys
-    }
+    return mean_profile(features)
 
 
 def _percentile(values: list[float], quantile: float) -> float:
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    idx = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * quantile))))
-    return float(ordered[idx])
+    return percentile(values, quantile)
