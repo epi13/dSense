@@ -6,6 +6,7 @@ from .utils.files import ensure_dir, write_json, read_json
 from .utils.timebase import utc_now_iso
 
 DATASETS = Path("datasets")
+DEFAULT_PROJECT = "base"
 
 
 def project_path(name: str) -> Path:
@@ -37,6 +38,9 @@ def save_manifest(name: str, data: dict[str, object]) -> None:
 def allocate_scene_id(name: str) -> str:
     data = load_manifest(name)
     n = int(data.get("next_scene", 1))
+    scenes_root = project_path(name) / "scenes"
+    while (scenes_root / f"scene_{n:06d}").exists():
+        n += 1
     data["next_scene"] = n + 1
     save_manifest(name, data)
     return f"scene_{n:06d}"

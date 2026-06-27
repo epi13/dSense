@@ -36,21 +36,24 @@ A future always-on dSense Watcher could learn a normal machine/room baseline, de
 
 Latent orbiters are future small interpreter models that sit close to substrate channels. They would summarize local timing and environment events for larger AI systems, allowing the larger model to receive compact statements such as “scheduler jitter increased,” “room-like perturbation detected,” or “baseline degraded.”
 
-## Current v0 scope: Python Scene Wizard
+## Current v1 scope: local dSense console
 
-v0 provides a terminal-based Python tool with:
+v1 provides a terminal-based Python tool with:
 
 - project initialization under `datasets/<project_name>/`
 - channel scanning
 - baseline recording
 - guided scene recording with pre-roll, action, and post-roll timing
+- a full-screen TUI phase dashboard for recording, learning, classification, channels, watcher scans, orbiter summaries, and transfer bundles
 - fixed 64-byte binary frames
-- event markers
+- automatic and manual event markers
 - scene metadata
 - preview CSV files
-- simple quality checks
+- baseline/anomaly model and deterministic scene classifier
+- strict portable channel adapters for CPU load, disk latency, optional network latency, and power state
+- local watcher, orbiter, and transfer artifacts
 
-No machine learning, microphone, camera, RF, thermal, or platform-specific hardware probes are implemented in v0.
+No microphone, camera, RF, broad environmental sensing, or external AI calls are implemented in v1. AI/orbiter enrichment is local-only and can be pointed at an embedded Gemma 4 Edge runtime.
 
 ## Install and run
 
@@ -61,7 +64,11 @@ python -m pip install -e .
 python -m dsense init demo_lab
 python -m dsense scan
 python -m dsense record-baseline demo_lab --duration 30
+python -m dsense tui --label person_walks_front_left_to_right --duration 10 --pre-roll 2 --action 5 --post-roll 3 --repeat 3
 python -m dsense scene demo_lab --label person_walks_front_left_to_right --duration 10 --pre-roll 2 --action 5 --post-roll 3 --repeat 3
+python -m dsense train-baseline
+python -m dsense train-classifier
+python -m dsense export-transfer
 python -m dsense list-scenes demo_lab
 python -m dsense export-preview demo_lab
 ```
@@ -71,6 +78,70 @@ If installed with the console script, replace `python -m dsense` with `dsense`.
 The default tick rate is 100 Hz. Higher rates are allowed with `--tick-hz`, but 1000 Hz can be unrealistic in Python depending on the OS, scheduler, and machine state.
 
 For non-interactive captures, `dsense scene` also provides `--yes` to keep captures without prompting.
+
+## TUI interaction recorder
+
+Use `python -m dsense` or `python -m dsense tui` for the full-screen recorder. By default it opens the base project at `datasets/base/`, loads all existing scenes from that project, and stores new captures there. To use another project, pass it explicitly, for example `python -m dsense tui demo_lab`.
+
+The TUI starts with an editable capture setup, shows detected channels, baseline/classifier status, the seven phase dashboard panels, and existing project scenes. It trains or refreshes local baseline/classifier models from accepted scenes, then records with a live overview of frame progress, current phase, timing drift, process estimate, and marker count. The setup screen includes preset groups for `user`, `baseline`, and `activity` scenes.
+
+The baseline model is stored at `datasets/<project_name>/exports/baseline_model.json`. The classifier is stored at `datasets/<project_name>/exports/classifier.json`. They use accepted scene previews to build baseline channel profiles and label summaries. They are retrained automatically when the TUI opens and after new accepted recordings are added, so automatic event detection improves as the project grows. You can retrain them explicitly with:
+
+```bash
+python -m dsense train-baseline
+python -m dsense train-classifier
+```
+
+On the setup screen:
+
+- `1`-`7` switches between phase panels: Record, Learn, Classify, Channels, Watcher, Orbiters, Transfer
+- `m` cycles scene mode: user interactions, baseline system scenes, and system activity scenes
+- `p` / `o` cycles presets inside the current mode
+- `g` toggles batch recording for the whole current preset group
+- `a` toggles automatic heuristic event detection
+- `t` retrains baseline and classifier models from accepted project scenes
+- `v` validates the project and summarizes health
+- `w` runs a local watcher scan and writes watcher/orbiter artifacts
+- `e` exports a local transfer bundle
+- `Enter` edits the selected field or cycles mode/preset/toggle fields
+- `c` starts recording
+- `q` exits the TUI from the setup screen
+
+During recording:
+
+- `scene_start`, `action_start`, `action_end`, and `scene_end` are recorded automatically and shown in the live event list
+- `heuristic_signal_spike` events are generated automatically when the built-in signal watcher sees a timing/process deviation
+- `SPACE` writes a `user_interaction_marker`
+- `n` writes a `noise_marker`
+- `q` writes a `review_flag`
+
+The live view shows the total event count, automatic/manual marker counts, a signal watcher meter, an event rail, and the newest recorded events. The event rail uses `S/A/E/X` for scheduled system events, `!` for heuristic signal events, and `*` for manual markers. Markers are saved to `events.jsonl` alongside `scene_start`, `action_start`, `action_end`, and `scene_end`. After each take, the TUI shows quality and frame counts and lets you keep, retake, or discard the recording. When a recording session completes, any key returns to the setup screen with the refreshed scene list. Existing scripted flows remain available through `record-baseline` and `scene`; `scene --tui` opens the same full-screen recorder using the scene command's arguments.
+
+Watcher scans save candidate scenes and append `watcher/events.jsonl`. Orbiter summaries are written to `exports/orbiters/summaries.jsonl`. Transfer bundles are written to `exports/transfer_bundle.json` and can be compared with:
+
+```bash
+python -m dsense compare-transfer datasets/base/exports/transfer_bundle.json
+```
+
+## Embedded Gemma 4 Edge
+
+dSense can enrich local orbiter summaries with an embedded Gemma 4 Edge runner. This is optional and disabled unless configured. dSense does not download a model or call a remote API; it sends a compact prompt to a local command over stdin and reads the summary from stdout.
+
+```bash
+python -m dsense gemma-status
+```
+
+If the LiteRT-LM model has been imported as `dsense-gemma-4-edge`, dSense enables it automatically. To use a different local runner or model path, set:
+
+```bash
+export DSENSE_GEMMA_CMD="/path/to/your/local/gemma-edge-runner --model /path/to/gemma --prompt {prompt}"
+export DSENSE_GEMMA_MODEL="gemma-4-edge"
+python -m dsense gemma-status
+```
+
+If your local runner reads prompts from stdin, omit `{prompt}` and dSense will pipe the prompt to the command instead.
+
+When enabled, watcher/orbiter summaries include `gemma_edge` metadata and `gemma_summary`. The TUI Orbiters phase shows whether Gemma Edge is on or off.
 
 ## Dataset format
 
@@ -89,9 +160,16 @@ datasets/<project_name>/
       notes.txt
       checksum.txt
   exports/
+    baseline_model.json
+    classifier.json
+    transfer_bundle.json
+    orbiters/
+      summaries.jsonl
+  watcher/
+    events.jsonl
 ```
 
-`scene.json` stores label, time windows, channel metadata, quality summary, acceptance state, and notes. `frames.ds64` contains only 64-byte frames. `events.jsonl` stores scene start, action start, action end, and scene end markers. `preview.csv` exposes inspectable columns: `tick`, `t_ns`, `dt_ns`, `sleep_drift_ns`, `process_ns_estimate`, and `quality_flags`. `checksum.txt` stores a SHA-256 checksum of the frame file.
+`scene.json` stores label, time windows, channel metadata, quality summary, acceptance state, and notes. `frames.ds64` contains only 64-byte frames. `events.jsonl` stores scene start, action start, action end, scene end, manual markers, and heuristic events. `preview.csv` exposes inspectable columns: `tick`, `t_ns`, `dt_ns`, `sleep_drift_ns`, `process_ns_estimate`, `quality_flags`, plus optional extra channel columns such as `cpu_load_ppm`, `disk_stat_latency_ns`, `network_latency_ns`, `power_online`, and `battery_percent`. `checksum.txt` stores a SHA-256 checksum of the frame file.
 
 ## Frame format summary
 
@@ -108,15 +186,15 @@ datasets/<project_name>/
 
 See `docs/frame-format.md` for the exact layout.
 
-## Research roadmap
+## Research roadmap status
 
-- Phase 0: Scene Wizard and dataset format.
-- Phase 1: baseline/anomaly learner.
-- Phase 2: simple scene classifier.
-- Phase 3: richer channel adapters.
-- Phase 4: local always-on dSense Watcher.
-- Phase 5: orbiters and AI integration.
-- Phase 6: cross-machine and cross-room transfer tests.
+- Phase 0: Scene Wizard and dataset format — implemented.
+- Phase 1: baseline/anomaly learner — implemented as a local robust baseline model and TUI signal watcher.
+- Phase 2: simple scene classifier — implemented as a deterministic nearest-profile classifier.
+- Phase 3: richer channel adapters — implemented with strict portable adapters and graceful degradation.
+- Phase 4: local always-on dSense Watcher — implemented as TUI-controlled watcher scans that save candidate scenes.
+- Phase 5: orbiters and AI integration — implemented as local JSONL orbiter summaries for downstream AI clients.
+- Phase 6: cross-machine and cross-room transfer tests — implemented as local transfer bundle export/compare.
 
 ## Privacy and safety
 

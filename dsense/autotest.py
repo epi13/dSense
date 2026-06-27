@@ -154,20 +154,16 @@ def validate_scene(scene_path: Path) -> SceneValidationResult:
             expected_events = {"scene_start", "action_start", "action_end", "scene_end"}
             event_types = {e.get("event") for e in events}
             
-            if event_types != expected_events:
+            if not expected_events <= event_types:
                 missing = expected_events - event_types
-                extra = event_types - expected_events
                 if missing:
                     errors.append(ValidationError(scene_id, "error", "events",
                         f"Missing event types: {missing}"))
-                if extra:
-                    errors.append(ValidationError(scene_id, "warning", "events",
-                        f"Unexpected event types: {extra}"))
             
             # Check timing consistency
             if events:
-                times = sorted([e.get("t_ms", 0) for e in events])
-                if times != sorted(times):  # Already checked above but be explicit
+                times = [e.get("t_ms", 0) for e in events]
+                if times != sorted(times):
                     errors.append(ValidationError(scene_id, "error", "events",
                         "Event times not in order"))
                 

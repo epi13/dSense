@@ -1,12 +1,17 @@
 from __future__ import annotations
 
-import argparse, csv
+import argparse, csv, sys
 from pathlib import Path
-from .manifest import init_project, scan_channels, project_path, load_manifest, allocate_scene_id
+from .baseline import train_and_save_project_baseline
+from .classifier import train_and_save_project_classifier
+from .gemma_edge import gemma_edge_status
+from .manifest import DEFAULT_PROJECT, init_project, scan_channels, project_path, load_manifest, allocate_scene_id
 from .recorder import record_scene
+from .tui import CaptureConfig, run_tui
 from .wizard import guided_scene
 from .utils.files import read_json
 from .autotest import validate_dataset, print_validation_report
+from .transfer import compare_transfer_bundle, export_transfer_bundle, transfer_bundle_path
 
 
 def cmd_init(args):
@@ -30,7 +35,37 @@ def cmd_record_baseline(args):
 def cmd_scene(args):
     init_project(args.project_name)
     duration = args.duration or (args.pre_roll + args.action + args.post_roll)
+    if args.tui:
+        run_tui(CaptureConfig(
+            project_name=args.project_name,
+            label=args.label,
+            duration=duration,
+            pre_roll=args.pre_roll,
+            action=args.action,
+            post_roll=args.post_roll,
+            repeat=args.repeat,
+            tick_hz=args.tick_hz,
+            notes=args.notes,
+        ))
+        return
     guided_scene(args.project_name, args.label, duration, args.pre_roll, args.action, args.post_roll, args.repeat, args.notes, args.tick_hz, args.yes)
+
+
+def cmd_tui(args):
+    project_name = args.project_name or DEFAULT_PROJECT
+    init_project(project_name)
+    duration = args.duration or (args.pre_roll + args.action + args.post_roll)
+    run_tui(CaptureConfig(
+        project_name=project_name,
+        label=args.label,
+        duration=duration,
+        pre_roll=args.pre_roll,
+        action=args.action,
+        post_roll=args.post_roll,
+        repeat=args.repeat,
+        tick_hz=args.tick_hz,
+        notes=args.notes,
+    ))
 
 
 def cmd_list(args):
@@ -61,19 +96,78 @@ def cmd_validate(args):
     print_validation_report(result, verbose=args.verbose)
 
 
+def cmd_train_classifier(args):
+    project_name = args.project_name or DEFAULT_PROJECT
+    init_project(project_name)
+    model = train_and_save_project_classifier(project_name)
+    print(f"Trained classifier for {project_name}: {model.scene_count} scenes, {model.baseline_scene_count} baseline scenes")
+    print(project_path(project_name) / "exports" / "classifier.json")
+
+
+def cmd_train_baseline(args):
+    project_name = args.project_name or DEFAULT_PROJECT
+    init_project(project_name)
+    model = train_and_save_project_baseline(project_name)
+    print(f"Trained baseline for {project_name}: {model.scene_count} baseline scenes, {len(model.channels)} channels")
+    print(project_path(project_name) / "exports" / "baseline_model.json")
+
+
+def cmd_export_transfer(args):
+    project_name = args.project_name or DEFAULT_PROJECT
+    init_project(project_name)
+    bundle = export_transfer_bundle(project_name)
+    print(f"Exported transfer bundle for {project_name}: {bundle['total_scenes']} scenes")
+    print(transfer_bundle_path(project_name))
+
+
+def cmd_compare_transfer(args):
+    if args.bundle is None:
+        project_name = DEFAULT_PROJECT
+        bundle = args.project_or_bundle
+    else:
+        project_name = args.project_or_bundle or DEFAULT_PROJECT
+        bundle = args.bundle
+    init_project(project_name)
+    result = compare_transfer_bundle(project_name, Path(bundle))
+    print(f"Compatibility: {result['compatibility']}")
+    print(f"Transfer risk: {result['transfer_risk']}")
+    print(f"Missing channels: {', '.join(result['missing_channels']) or 'none'}")
+    print(f"Extra channels: {', '.join(result['extra_channels']) or 'none'}")
+    print(f"Max baseline drift: {result['baseline_drift']['max_drift']:.3f}")
+
+
+def cmd_gemma_status(args):
+    status = gemma_edge_status()
+    state = "enabled" if status["enabled"] else "disabled"
+    print(f"Gemma Edge: {state}")
+    print(f"Model: {status['model']}")
+    print(f"Command: {status['command'] or 'not set'}")
+    print(f"Mode: {status['mode']}")
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="dsense", description="dSense Scene Wizard")
     sub = p.add_subparsers(required=True)
     sp = sub.add_parser("init"); sp.add_argument("project_name"); sp.set_defaults(func=cmd_init)
     sp = sub.add_parser("scan"); sp.set_defaults(func=cmd_scan)
     sp = sub.add_parser("record-baseline"); sp.add_argument("project_name"); sp.add_argument("--duration", type=float, default=30); sp.add_argument("--tick-hz", type=int, default=100); sp.add_argument("--notes", default=""); sp.set_defaults(func=cmd_record_baseline)
-    sp = sub.add_parser("scene"); sp.add_argument("project_name"); sp.add_argument("--label", required=True); sp.add_argument("--duration", type=float); sp.add_argument("--pre-roll", type=float, default=2); sp.add_argument("--action", type=float, default=5); sp.add_argument("--post-roll", type=float, default=3); sp.add_argument("--repeat", type=int, default=1); sp.add_argument("--notes", default=""); sp.add_argument("--tick-hz", type=int, default=100); sp.add_argument("--yes", action="store_true", help="accept captures without prompt"); sp.set_defaults(func=cmd_scene)
+    sp = sub.add_parser("scene"); sp.add_argument("project_name"); sp.add_argument("--label", required=True); sp.add_argument("--duration", type=float); sp.add_argument("--pre-roll", type=float, default=2); sp.add_argument("--action", type=float, default=5); sp.add_argument("--post-roll", type=float, default=3); sp.add_argument("--repeat", type=int, default=1); sp.add_argument("--notes", default=""); sp.add_argument("--tick-hz", type=int, default=100); sp.add_argument("--yes", action="store_true", help="accept captures without prompt"); sp.add_argument("--tui", action="store_true", help="record with the full-screen interaction recorder"); sp.set_defaults(func=cmd_scene)
+    sp = sub.add_parser("tui"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to open (default: {DEFAULT_PROJECT})"); sp.add_argument("--label", default="user_interaction"); sp.add_argument("--duration", type=float); sp.add_argument("--pre-roll", type=float, default=2); sp.add_argument("--action", type=float, default=5); sp.add_argument("--post-roll", type=float, default=3); sp.add_argument("--repeat", type=int, default=1); sp.add_argument("--notes", default=""); sp.add_argument("--tick-hz", type=int, default=100); sp.set_defaults(func=cmd_tui)
     sp = sub.add_parser("list-scenes"); sp.add_argument("project_name"); sp.set_defaults(func=cmd_list)
     sp = sub.add_parser("export-preview"); sp.add_argument("project_name"); sp.set_defaults(func=cmd_export)
     sp = sub.add_parser("validate"); sp.add_argument("project_name"); sp.add_argument("--verbose", "-v", action="store_true", help="show detailed error messages"); sp.set_defaults(func=cmd_validate)
+    sp = sub.add_parser("train-baseline"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to train (default: {DEFAULT_PROJECT})"); sp.set_defaults(func=cmd_train_baseline)
+    sp = sub.add_parser("train-classifier"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to train (default: {DEFAULT_PROJECT})"); sp.set_defaults(func=cmd_train_classifier)
+    sp = sub.add_parser("export-transfer"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to export (default: {DEFAULT_PROJECT})"); sp.set_defaults(func=cmd_export_transfer)
+    sp = sub.add_parser("compare-transfer"); sp.add_argument("project_or_bundle", help="project name or transfer bundle JSON path"); sp.add_argument("bundle", nargs="?", help="transfer bundle JSON path"); sp.set_defaults(func=cmd_compare_transfer)
+    sp = sub.add_parser("gemma-status"); sp.set_defaults(func=cmd_gemma_status)
     return p
 
 
 def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        argv = ["tui"]
     args = build_parser().parse_args(argv)
     args.func(args)

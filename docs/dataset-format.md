@@ -16,6 +16,13 @@ datasets/demo_lab/
       checksum.txt
   exports/
     preview_index.csv
+    baseline_model.json
+    classifier.json
+    transfer_bundle.json
+    orbiters/
+      summaries.jsonl
+  watcher/
+    events.jsonl
 ```
 
 Example `scene.json`:
@@ -50,4 +57,6 @@ Example `events.jsonl`:
 {"t_ms":10000,"event":"scene_end"}
 ```
 
-`preview.csv` is intentionally simple for inspection and plotting. It includes `tick`, `t_ns`, `dt_ns`, `sleep_drift_ns`, `process_ns_estimate`, and `quality_flags`.
+`preview.csv` is intentionally simple for inspection and plotting. It includes `tick`, `t_ns`, `dt_ns`, `sleep_drift_ns`, `process_ns_estimate`, and `quality_flags`. v1 may add optional strict-portable channel columns such as `cpu_load_ppm`, `disk_stat_latency_ns`, `network_latency_ns`, `power_online`, and `battery_percent`.
+
+`baseline_model.json`, `classifier.json`, `transfer_bundle.json`, watcher events, and orbiter summaries are derived artifacts. They can be regenerated from accepted scenes and do not change the fixed 64-byte frame format.

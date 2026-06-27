@@ -21,5 +21,11 @@ Channel bit assignments in v0:
 - bit 0: `clock_delta`
 - bit 1: `sleep_jitter`
 - bit 2: `process_probe`
+- bit 3: `cpu_load`
+- bit 4: `disk_latency`
+- bit 5: `network_latency` (optional, disabled unless configured)
+- bit 6: `power_state` (available when the OS exposes battery/power files)
 
 The MIX lane is not cryptographic entropy. It is a deterministic digest-based representation intended to reduce obvious bias for downstream experiments while preserving honest documentation of its limits.
+
+Only the original RAW fields are packed into the fixed 64-byte frame. Additional v1 channel values are stored in `preview.csv` and scene metadata so older frame readers remain compatible.

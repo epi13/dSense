@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 from .manifest import allocate_scene_id, project_path
 from .recorder import record_scene
+from .utils.files import write_json
 
 
 def countdown(seconds: int = 3) -> None:
@@ -32,5 +33,6 @@ def guided_scene(project: str, label: str, duration: float, pre_roll: float, act
         elif keep == "r":
             print("Retake requested; current take marked unaccepted.")
             scene["accepted"] = False
+        write_json(scene_dir / "scene.json", scene)
         results.append(scene)
     return results
