@@ -4,7 +4,7 @@ from pathlib import Path
 
 from dsense.autotest import validate_dataset
 from dsense.baseline import load_project_baseline
-from dsense.baseline_suite import baseline_suite_report_path, plan_baseline_suite, run_baseline_suite
+from dsense.baseline_suite import baseline_suite_report_path, count_baseline_suite_scenes, ensure_startup_baseline_suite, plan_baseline_suite, run_baseline_suite
 from dsense.cli import build_parser
 
 
@@ -63,6 +63,31 @@ def test_baseline_suite_tiny_run_writes_report_and_validates(tmp_path: Path, mon
     assert model.scene_count >= 3
 
 
+def test_startup_baseline_suite_fills_to_target_once(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    first = ensure_startup_baseline_suite("base", target_scenes=3, duration=0.03, tick_hz=10, linux=False)
+    second = ensure_startup_baseline_suite("base", target_scenes=3, duration=0.03, tick_hz=10, linux=False)
+
+    assert first["status"] == "recorded"
+    assert first["recorded"] == 3
+    assert second["status"] == "reused"
+    assert count_baseline_suite_scenes("base") == 3
+
+
+def test_startup_baseline_suite_fills_missing_with_label_offset(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    ensure_startup_baseline_suite("base", target_scenes=2, duration=0.03, tick_hz=10, linux=False)
+
+    result = ensure_startup_baseline_suite("base", target_scenes=4, duration=0.03, tick_hz=10, linux=False)
+    labels = sorted(path.read_text(encoding="utf-8") for path in (tmp_path / "datasets" / "base" / "scenes").glob("scene_*/scene.json"))
+
+    assert result["recorded"] == 2
+    assert count_baseline_suite_scenes("base") == 4
+    assert any("_003" in label for label in labels)
+    assert any("_004" in label for label in labels)
+
+
 def test_baseline_suite_cli_parser_accepts_options():
     args = build_parser().parse_args([
         "baseline-suite",
@@ -87,3 +112,24 @@ def test_baseline_suite_cli_parser_accepts_options():
     assert args.exclude_categories == "cpu"
     assert args.seed == 7
     assert args.dry_run is True
+
+
+def test_tui_parser_accepts_startup_suite_flags():
+    args = build_parser().parse_args([
+        "tui",
+        "base",
+        "--no-startup-suite",
+        "--startup-suite-target",
+        "7",
+        "--startup-suite-duration",
+        "0.1",
+        "--startup-suite-seed",
+        "9",
+        "--no-startup-suite-linux",
+    ])
+
+    assert args.no_startup_suite is True
+    assert args.startup_suite_target == 7
+    assert args.startup_suite_duration == 0.1
+    assert args.startup_suite_seed == 9
+    assert args.startup_suite_linux is False

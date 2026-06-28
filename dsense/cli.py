@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse, csv, json, sys
 from pathlib import Path
 from .baseline import default_auto_baseline_policy, ensure_startup_baseline, train_and_save_project_baseline
-from .baseline_suite import baseline_suite_report_path, run_baseline_suite
+from .baseline_suite import baseline_suite_report_path, ensure_startup_baseline_suite, run_baseline_suite
 from .channels import parse_channel_groups
 from .classifier import train_and_save_project_classifier
 from .doctor import doctor_ok, print_doctor_report, run_doctor
@@ -208,6 +208,24 @@ def _run_tui_config(**kwargs) -> list[dict[str, object]]:
         raise
 
 
+def _project_scene_stats(project_name: str) -> dict[str, int]:
+    root = project_path(project_name) / "scenes"
+    stats = {"total": 0, "accepted": 0, "baseline": 0}
+    if not root.exists():
+        return stats
+    for path in sorted(root.glob("scene_*/scene.json")):
+        try:
+            scene = read_json(path)
+        except (OSError, ValueError):
+            continue
+        stats["total"] += 1
+        if scene.get("accepted") is not False:
+            stats["accepted"] += 1
+            if str(scene.get("label", "")).startswith("baseline_"):
+                stats["baseline"] += 1
+    return stats
+
+
 def cmd_scene(args):
     init_project(args.project_name)
     duration = _validated_duration(args.duration, args.pre_roll, args.action, args.post_roll)
@@ -250,6 +268,23 @@ def cmd_tui(args):
         print("Baseline ready.")
     elif status.get("status") == "failed":
         print("Continuing without startup baseline.")
+    startup_suite_status = "Startup system suite: skipped"
+    if args.no_startup_suite:
+        startup_suite_status = "Startup system suite: skipped by --no-startup-suite"
+        print(startup_suite_status)
+    else:
+        print(f"Checking startup system suite... target={args.startup_suite_target}")
+        suite_status = ensure_startup_baseline_suite(
+            project_name,
+            target_scenes=args.startup_suite_target,
+            duration=args.startup_suite_duration,
+            tick_hz=args.tick_hz,
+            linux=args.startup_suite_linux,
+            seed=args.startup_suite_seed,
+            enabled=True,
+        )
+        startup_suite_status = str(suite_status.get("message", "Startup system suite status unknown"))
+        print(startup_suite_status)
     print("Opening TUI...")
     duration = _validated_duration(args.duration, args.pre_roll, args.action, args.post_roll)
     _validate_repeat_tick(args.repeat, args.tick_hz)
@@ -263,7 +298,7 @@ def cmd_tui(args):
         repeat=args.repeat,
         tick_hz=args.tick_hz,
         notes=args.notes,
-        startup_baseline_status=startup_baseline_status,
+        startup_baseline_status=f"{startup_baseline_status} | {startup_suite_status}",
     )
 
 
@@ -291,8 +326,10 @@ def cmd_export(args):
 
 def cmd_validate(args):
     """Validate all scenes in a project and print a detailed report."""
+    print(f"Validating dataset: {args.project_name}", flush=True)
     result = validate_dataset(args.project_name)
     print_validation_report(result, verbose=args.verbose)
+    print(f"Validation complete: {result.valid_scenes}/{result.total_scenes} valid, errors={result.error_count}, warnings={result.warning_count}")
 
 
 def cmd_doctor(args):
@@ -305,8 +342,14 @@ def cmd_doctor(args):
 def cmd_train_classifier(args):
     project_name = args.project_name or DEFAULT_PROJECT
     init_project(project_name)
+    stats = _project_scene_stats(project_name)
+    print(f"Training classifier: {project_name}", flush=True)
+    print(f"  scenes discovered: {stats['total']} total, {stats['accepted']} accepted, {stats['baseline']} baseline labels", flush=True)
     _require_valid_dataset(project_name, args.require_valid)
+    print("  extracting preview features and label profiles...", flush=True)
     model = train_and_save_project_classifier(project_name)
+    manifest = dict(model.feature_manifest)
+    print(f"  model labels: {len(model.label_counts)} labels, {manifest.get('feature_count', 0)} features", flush=True)
     print(f"Trained classifier for {project_name}: {model.scene_count} scenes, {model.baseline_scene_count} baseline scenes")
     print(project_path(project_name) / "exports" / "classifier.json")
 
@@ -314,8 +357,14 @@ def cmd_train_classifier(args):
 def cmd_train_baseline(args):
     project_name = args.project_name or DEFAULT_PROJECT
     init_project(project_name)
+    stats = _project_scene_stats(project_name)
+    print(f"Training baseline: {project_name}", flush=True)
+    print(f"  scenes discovered: {stats['total']} total, {stats['accepted']} accepted, {stats['baseline']} baseline labels", flush=True)
     _require_valid_dataset(project_name, args.require_valid)
+    print("  reading baseline previews and computing robust channel profiles...", flush=True)
     model = train_and_save_project_baseline(project_name)
+    manifest = dict(model.feature_manifest)
+    print(f"  model channels: {len(model.channels)} channels, {manifest.get('feature_count', 0)} features", flush=True)
     print(f"Trained baseline for {project_name}: {model.scene_count} baseline scenes, {len(model.channels)} channels")
     print(project_path(project_name) / "exports" / "baseline_model.json")
 
@@ -468,6 +517,7 @@ def cmd_watcher(args):
     init_project(project_name)
     validate_capture_params(max(args.duration, 0.01) if args.duration else 0.01, args.tick_hz)
     if args.rolling:
+        print(f"Starting rolling watcher: project={project_name} tick_hz={args.tick_hz} pre={args.pre}s post={args.post}s duration={args.duration or 'continuous'}", flush=True)
         result = run_rolling_watcher(
             project_name,
             pre_seconds=args.pre,
@@ -484,6 +534,7 @@ def cmd_watcher(args):
             event = dict(saved["event"])
             print(f"{scene.get('scene_id')} score={event.get('anomaly_score')} label={scene.get('label')} accepted={scene.get('accepted')}")
         return
+    print(f"Starting watcher scan: project={project_name} duration={args.duration or 5.0}s tick_hz={args.tick_hz}", flush=True)
     result = run_watcher_scan(project_name, duration=args.duration or 5.0, tick_hz=args.tick_hz)
     scene = dict(result["scene"])
     print(f"Watcher scan saved {scene.get('scene_id')} label={scene.get('label')} accepted={scene.get('accepted')}")
@@ -563,7 +614,7 @@ def build_parser():
     sp.add_argument("--include-heavy", action="store_true", help="include heavier opt-in workloads")
     sp.set_defaults(func=cmd_baseline_suite)
     sp = sub.add_parser("scene"); sp.add_argument("project_name"); sp.add_argument("--label", required=True); sp.add_argument("--duration", type=float); sp.add_argument("--pre-roll", type=float, default=2); sp.add_argument("--action", type=float, default=5); sp.add_argument("--post-roll", type=float, default=3); sp.add_argument("--repeat", type=int, default=1); sp.add_argument("--notes", default=""); sp.add_argument("--tick-hz", type=int, default=100); sp.add_argument("--channels", default="portable", help="channel groups, e.g. portable or portable,linux"); sp.add_argument("--yes", action="store_true", help="accept captures without prompt"); sp.add_argument("--tui", action="store_true", help="record with the full-screen interaction recorder"); sp.set_defaults(func=cmd_scene)
-    sp = sub.add_parser("tui"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to open (default: {DEFAULT_PROJECT})"); sp.add_argument("--label", default="user_interaction"); sp.add_argument("--duration", type=float); sp.add_argument("--pre-roll", type=float, default=2); sp.add_argument("--action", type=float, default=5); sp.add_argument("--post-roll", type=float, default=3); sp.add_argument("--repeat", type=int, default=1); sp.add_argument("--notes", default=""); sp.add_argument("--tick-hz", type=int, default=100); sp.add_argument("--auto-baseline-policy", choices=["auto", "startup", "missing-only", "off"], default="auto", help="startup baseline policy; auto uses startup on Linux and missing-only elsewhere"); sp.add_argument("--no-auto-baseline", action="store_true", help="same as --auto-baseline-policy off"); sp.add_argument("--auto-baseline-duration", type=float, default=5.0, help="seconds for automatic startup baseline capture"); sp.add_argument("--force-auto-baseline", action="store_true", help="record a fresh startup baseline unless policy is off"); sp.set_defaults(func=cmd_tui)
+    sp = sub.add_parser("tui"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to open (default: {DEFAULT_PROJECT})"); sp.add_argument("--label", default="user_interaction"); sp.add_argument("--duration", type=float); sp.add_argument("--pre-roll", type=float, default=2); sp.add_argument("--action", type=float, default=5); sp.add_argument("--post-roll", type=float, default=3); sp.add_argument("--repeat", type=int, default=1); sp.add_argument("--notes", default=""); sp.add_argument("--tick-hz", type=int, default=100); sp.add_argument("--auto-baseline-policy", choices=["auto", "startup", "missing-only", "off"], default="auto", help="startup baseline policy; auto uses startup on Linux and missing-only elsewhere"); sp.add_argument("--no-auto-baseline", action="store_true", help="same as --auto-baseline-policy off"); sp.add_argument("--auto-baseline-duration", type=float, default=5.0, help="seconds for automatic startup baseline capture"); sp.add_argument("--force-auto-baseline", action="store_true", help="record a fresh startup baseline unless policy is off"); sp.add_argument("--no-startup-suite", action="store_true", help="skip filling the automatic system baseline/control suite on TUI startup"); sp.add_argument("--startup-suite-target", type=int, default=200, help="target number of baseline-suite scenes to maintain before opening TUI"); sp.add_argument("--startup-suite-duration", type=float, default=0.2, help="seconds per automatic startup-suite scene"); sp.add_argument("--startup-suite-seed", type=int, default=42); sp.add_argument("--startup-suite-linux", action=argparse.BooleanOptionalAction, default=True, help="include Linux-safe startup-suite controls"); sp.set_defaults(func=cmd_tui)
     sp = sub.add_parser("list-scenes"); sp.add_argument("project_name"); sp.set_defaults(func=cmd_list)
     sp = sub.add_parser("export-preview"); sp.add_argument("project_name"); sp.set_defaults(func=cmd_export)
     sp = sub.add_parser("validate"); sp.add_argument("project_name"); sp.add_argument("--verbose", "-v", action="store_true", help="show detailed error messages"); sp.set_defaults(func=cmd_validate)

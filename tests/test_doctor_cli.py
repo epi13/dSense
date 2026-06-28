@@ -75,6 +75,20 @@ def test_require_valid_bad_dataset_message(sample_dataset, capsys):
     assert "Missing CSV columns" in out
 
 
+def test_training_commands_print_progress(sample_dataset, capsys):
+    main(["train-baseline", DEFAULT_PROJECT])
+    baseline_out = capsys.readouterr().out
+    assert "Training baseline: base" in baseline_out
+    assert "scenes discovered:" in baseline_out
+    assert "computing robust channel profiles" in baseline_out
+
+    main(["train-classifier", DEFAULT_PROJECT])
+    classifier_out = capsys.readouterr().out
+    assert "Training classifier: base" in classifier_out
+    assert "extracting preview features" in classifier_out
+    assert "model labels:" in classifier_out
+
+
 def test_privacy_report_and_redacted_export_commands(sample_dataset, capsys):
     main(["privacy-report", DEFAULT_PROJECT])
     report_out = capsys.readouterr().out

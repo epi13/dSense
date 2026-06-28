@@ -160,6 +160,8 @@ The TUI is Linux/Unix-first because it depends on terminal curses behavior. Non-
 
 When the TUI opens on Linux/Fedora, dSense records a short local startup baseline scene labeled `baseline_startup_auto`, trains `exports/baseline_model.json`, and then opens the interface. This means the scene count should increase by one each time the TUI starts unless startup baseline capture is disabled. On non-Linux systems the default policy is `missing-only`, so dSense records this startup baseline only when no usable baseline model exists. dSense tries portable plus readable Linux channels for startup baselines; unavailable channels are skipped without privileged requirements.
 
+The TUI also fills the automatic system baseline/control suite before opening. By default it targets 200 `baseline_suite` scenes on Linux, so a new or shallow project will add many automatic idle/timing/CPU/memory/disk/proc/combined/drift control captures before the interface appears. If the project already has enough suite scenes, dSense reuses them instead of creating duplicates.
+
 Startup baseline controls:
 
 ```bash
@@ -169,6 +171,9 @@ dsense tui base --auto-baseline-policy missing-only
 dsense tui base --auto-baseline-policy startup
 dsense tui base --force-auto-baseline
 dsense tui base --auto-baseline-duration 10
+dsense tui base --no-startup-suite
+dsense tui base --startup-suite-target 200
+dsense tui base --startup-suite-duration 0.2
 ```
 
 The TUI opens as a tabbed local control panel. The tab bar includes `Record`, `Scenes`, `Channels`, `Learn`, `Classify`, `Watcher`, `Orbiters`, `Transfer`, `Validate`, and `Help`. The `Record` tab keeps the editable capture setup with preset groups for `user`, `baseline`, and `activity` scenes. `Scenes` lets you browse recorded scenes and inspect wrapped scene notes. `Channels` shows adapter status. `Learn` and `Classify` show local model state. `Watcher`, `Orbiters`, `Transfer`, and `Validate` expose the project tools without leaving the terminal.

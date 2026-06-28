@@ -13,7 +13,7 @@ from .inputs import validate_capture_params
 from .manifest import allocate_scene_id, init_project, project_path, scan_channels
 from .models.evaluation import evaluate_project_scenes
 from .recorder import record_scene
-from .utils.files import ensure_dir, write_json
+from .utils.files import ensure_dir, read_json, write_json
 from .utils.timebase import utc_now_iso
 from .workloads import valid_workload_ids, workload_progress_callback
 
@@ -72,6 +72,7 @@ def plan_baseline_suite(
     include_network: bool = False,
     include_heavy: bool = False,
     linux: bool = True,
+    label_offset: int = 0,
 ) -> dict[str, object]:
     if target_scenes < 1:
         raise ValueError("target_scenes must be >= 1")
@@ -108,12 +109,13 @@ def plan_baseline_suite(
     order = order[:target_scenes]
     planned = []
     for index, scenario in enumerate(order, start=1):
+        label_index = label_offset + index
         planned.append({
             "order": index,
             "category": scenario.category,
             "name": scenario.name,
             "base_label": scenario.base_label,
-            "label": f"{scenario.base_label}_{index:03d}",
+            "label": f"{scenario.base_label}_{label_index:03d}",
             "workload": scenario.workload,
             "duration": round(duration * scenario.duration_scale, 6),
             "manual": False,
@@ -151,11 +153,12 @@ def run_baseline_suite(
     assume_yes: bool = False,
     include_network: bool = False,
     include_heavy: bool = False,
+    label_offset: int = 0,
 ) -> dict[str, object]:
     validate_capture_params(duration, tick_hz)
     init_project(project_name)
     network_enabled = include_network and bool(os.environ.get("DSENSE_NET_HOST"))
-    plan = plan_baseline_suite(target_scenes, categories, exclude_categories, seed, duration, network_enabled, include_heavy, linux)
+    plan = plan_baseline_suite(target_scenes, categories, exclude_categories, seed, duration, network_enabled, include_heavy, linux, label_offset=label_offset)
     channel_groups = ["portable", "linux"] if linux else ["portable"]
     channel_status = scan_channels(advanced=linux, groups=channel_groups)
     if dry_run:
@@ -258,3 +261,65 @@ def noisy_channel_summary(channels: dict[str, dict[str, float]], limit: int = 10
         score = mad / max(center, 1.0) + variance / max(center * center, 1.0)
         rows.append({"channel": channel, "instability_score": round(score, 6), "mad": mad, "variance": variance})
     return sorted(rows, key=lambda item: (-float(item["instability_score"]), str(item["channel"])))[:limit]
+
+
+def count_baseline_suite_scenes(project_name: str) -> int:
+    scenes_root = project_path(project_name) / "scenes"
+    if not scenes_root.exists():
+        return 0
+    count = 0
+    for scene_path in sorted(scenes_root.glob("scene_*/scene.json")):
+        try:
+            scene = read_json(scene_path)
+        except (OSError, ValueError):
+            continue
+        suite = scene.get("suite")
+        if scene.get("accepted") is not False and (scene.get("mode") == "baseline_suite" or isinstance(suite, dict)):
+            count += 1
+    return count
+
+
+def ensure_startup_baseline_suite(
+    project_name: str,
+    target_scenes: int = 200,
+    duration: float = 0.2,
+    tick_hz: int = 50,
+    linux: bool = True,
+    seed: int | None = 42,
+    enabled: bool = True,
+) -> dict[str, object]:
+    if target_scenes < 1:
+        raise ValueError("target_scenes must be >= 1")
+    validate_capture_params(duration, tick_hz)
+    init_project(project_name)
+    if not enabled:
+        return {"status": "skipped", "recorded": 0, "message": "Startup system suite: skipped"}
+    existing = count_baseline_suite_scenes(project_name)
+    if existing >= target_scenes:
+        return {
+            "status": "reused",
+            "recorded": 0,
+            "existing": existing,
+            "target": target_scenes,
+            "message": f"Startup system suite: already has {existing}/{target_scenes} suite scenes",
+        }
+    missing = target_scenes - existing
+    report = run_baseline_suite(
+        project_name,
+        target_scenes=missing,
+        seed=seed,
+        duration=duration,
+        tick_hz=tick_hz,
+        linux=linux,
+        assume_yes=True,
+        label_offset=existing,
+    )
+    recorded = int(report.get("actual_scene_count", 0))
+    return {
+        "status": "recorded",
+        "recorded": recorded,
+        "existing": existing,
+        "target": target_scenes,
+        "message": f"Startup system suite: recorded {recorded} scenes ({existing + recorded}/{target_scenes})",
+        "report": report,
+    }
