@@ -2,7 +2,17 @@ from dsense.cli import build_parser
 from dsense.classifier import SceneClassifierModel
 from dsense.manifest import DEFAULT_PROJECT, init_project
 from dsense.scenarios import SCENARIO_GROUPS
-from dsense.tui import classifier_summary_lines, load_project_scenes, scheduled_scene_events, summarize_scene_counts, system_event_marker
+from dsense.tui import (
+    TABS,
+    classifier_summary_lines,
+    load_project_scenes,
+    scene_detail_lines,
+    scheduled_scene_events,
+    summarize_scene_counts,
+    system_event_marker,
+    tab_index_delta,
+    wrap_text,
+)
 from dsense.utils.files import write_json
 
 
@@ -34,6 +44,37 @@ def test_tui_scenario_groups_include_baseline_activity_and_user_presets():
     assert SCENARIO_GROUPS["baseline"]
     assert SCENARIO_GROUPS["activity"]
     assert SCENARIO_GROUPS["user"]
+
+
+def test_tui_tabs_include_expected_sections():
+    assert TABS == ["Record", "Scenes", "Channels", "Learn", "Classify", "Watcher", "Orbiters", "Transfer", "Validate", "Help"]
+
+
+def test_tab_index_delta_wraps_next_and_previous():
+    assert tab_index_delta(0, 1) == 1
+    assert tab_index_delta(len(TABS) - 1, 1) == 0
+    assert tab_index_delta(0, -1) == len(TABS) - 1
+
+
+def test_wrap_text_handles_empty_and_long_notes():
+    assert wrap_text("", 20) == ["(no notes)"]
+    lines = wrap_text("alpha beta gamma delta", 10)
+    assert lines == ["alpha beta", "gamma", "delta"]
+    assert all(len(line) <= 10 for line in wrap_text("averyveryverylongword", 6))
+
+
+def test_scene_detail_lines_handle_missing_and_long_notes_separately():
+    lines = scene_detail_lines({
+        "scene_id": "scene_000001",
+        "label": "baseline_idle",
+        "duration_ms": 1000,
+        "tick_hz": 10,
+        "accepted": True,
+        "quality": {"confidence": 1.0, "actual_frames": 10, "expected_frames": 10},
+    })
+
+    assert any("scene_000001" in line for line in lines)
+    assert any("baseline_idle" in line for line in lines)
 
 
 def test_summarize_scene_counts_splits_baseline_and_user_labels():

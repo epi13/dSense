@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import curses
+import textwrap
 import time
 from dataclasses import dataclass
 
@@ -16,6 +17,12 @@ from .scenarios import SCENARIO_GROUPS
 from .transfer import export_transfer_bundle, transfer_bundle_path
 from .utils.files import read_json, write_json
 from .watcher import read_recent_watcher_events, run_watcher_scan
+from .workloads import workload_progress_callback
+
+
+TABS = ["Record", "Scenes", "Channels", "Learn", "Classify", "Watcher", "Orbiters", "Transfer", "Validate", "Help"]
+MIN_TUI_HEIGHT = 18
+MIN_TUI_WIDTH = 60
 
 
 @dataclass
@@ -33,6 +40,7 @@ class CaptureConfig:
     repeat: int = 1
     tick_hz: int = 100
     notes: str = ""
+    workload_id: str | None = None
 
 
 class SceneRecorderTUI:
@@ -43,7 +51,11 @@ class SceneRecorderTUI:
         self.scenes = load_project_scenes(config.project_name)
         self.baseline = self._train_baseline()
         self.classifier = self._train_classifier()
+        self.tab_index = 0
         self.phase_index = 0
+        self.scene_index = max(0, len(self.scenes) - 1)
+        self.scene_scroll = 0
+        self.last_validation_result = None
         self.validation_summary = "not run"
         self.watcher_summary = "idle"
         self.transfer_summary = "not exported"
@@ -140,11 +152,26 @@ class SceneRecorderTUI:
         while True:
             self._draw_config(fields, idx)
             key = self.screen.getch()
-            if key in (curses.KEY_UP, ord("k")):
+            current_tab = TABS[self.tab_index]
+            if key == 9:
+                self._cycle_tab(1)
+            elif key in (curses.KEY_BTAB, curses.KEY_LEFT):
+                self._cycle_tab(-1)
+            elif key == curses.KEY_RIGHT:
+                self._cycle_tab(1)
+            elif ord("1") <= key <= ord("9"):
+                self.tab_index = min(key - ord("1"), len(TABS) - 1)
+            elif key == ord("0"):
+                self.tab_index = 9 if len(TABS) >= 10 else len(TABS) - 1
+            elif current_tab == "Scenes" and key in (curses.KEY_UP, ord("k")):
+                self._move_scene_selection(-1)
+            elif current_tab == "Scenes" and key in (curses.KEY_DOWN, ord("j")):
+                self._move_scene_selection(1)
+            elif current_tab == "Record" and key in (curses.KEY_UP, ord("k")):
                 idx = max(0, idx - 1)
-            elif key in (curses.KEY_DOWN, ord("j"), 9):
+            elif current_tab == "Record" and key in (curses.KEY_DOWN, ord("j")):
                 idx = min(len(fields) - 1, idx + 1)
-            elif key in (10, 13):
+            elif current_tab == "Record" and key in (10, 13):
                 name, title = fields[idx]
                 if name == "mode":
                     self._cycle_mode()
@@ -159,9 +186,9 @@ class SceneRecorderTUI:
                     self._set_config_value(name, value)
             elif key in (ord("m"), ord("M")):
                 self._cycle_mode()
-            elif key in (ord("p"), ord("P"), curses.KEY_RIGHT):
+            elif key in (ord("p"), ord("P")):
                 self._cycle_scenario(1)
-            elif key in (ord("o"), ord("O"), curses.KEY_LEFT):
+            elif key in (ord("o"), ord("O")):
                 self._cycle_scenario(-1)
             elif key in (ord("g"), ord("G")):
                 self.config.record_group = not self.config.record_group
@@ -183,55 +210,244 @@ class SceneRecorderTUI:
                 self.classifier = self._train_classifier()
             elif key in (ord("e"), ord("E")):
                 self.transfer_summary = self._export_transfer_summary()
-            elif ord("1") <= key <= ord("7"):
-                self.phase_index = key - ord("1")
             elif key in (ord("c"), ord("C")):
-                return True
+                if current_tab == "Record":
+                    return True
             elif key in (ord("q"), ord("Q")):
                 return False
 
     def _draw_config(self, fields: list[tuple[str, str]], selected: int) -> None:
         self.screen.erase()
         h, w = self.screen.getmaxyx()
-        self._title("dSense Interaction Recorder", "Configure capture")
-        self._box(2, 0, min(17, h - 4), max(30, min(w - 1, w // 2)), "Scene")
-        for i, (name, title) in enumerate(fields):
+        if h < MIN_TUI_HEIGHT or w < MIN_TUI_WIDTH:
+            self._add(0, 0, "Terminal too small. Please enlarge the window.")
+            self.screen.refresh()
+            return
+        self._title("dSense Control Panel", self.config.project_name)
+        self._draw_tabs(1, 0, w)
+        tab = TABS[self.tab_index]
+        if tab == "Record":
+            self._draw_record_tab(fields, selected, 3, h, w)
+        elif tab == "Scenes":
+            self._draw_scenes_tab(3, h, w)
+        elif tab == "Channels":
+            self._draw_channels_tab(3, h, w)
+        elif tab == "Learn":
+            self._draw_learn_tab(3, h, w)
+        elif tab == "Classify":
+            self._draw_classify_tab(3, h, w)
+        elif tab == "Watcher":
+            self._draw_watcher_tab(3, h, w)
+        elif tab == "Orbiters":
+            self._draw_orbiters_tab(3, h, w)
+        elif tab == "Transfer":
+            self._draw_transfer_tab(3, h, w)
+        elif tab == "Validate":
+            self._draw_validate_tab(3, h, w)
+        elif tab == "Help":
+            self._draw_help_tab(3, h, w)
+        self._add(h - 2, 2, "TAB tabs | 1-0 jump | c record | t train | v validate | w watcher | e export | q exit")
+        self.screen.refresh()
+
+    def _draw_tabs(self, y: int, x: int, width: int) -> None:
+        col = x
+        for i, tab in enumerate(TABS):
+            label = f"[ {tab} ]"
+            attr = curses.A_REVERSE | curses.A_BOLD if i == self.tab_index else 0
+            if col + len(label) >= x + width - 1:
+                break
+            self._add(y, col, label, attr)
+            col += len(label) + 1
+
+    def _draw_record_tab(self, fields: list[tuple[str, str]], selected: int, y: int, h: int, w: int) -> None:
+        left_w = max(30, min(w - 2, w // 2))
+        record_h = max(4, min(17, h - y - 4))
+        self._box(y, 0, record_h, left_w, "Record")
+        self._add(y + 1, 2, f"Project {self.config.project_name}")
+        for i, (name, title) in enumerate(fields[:max(1, record_h - 4)]):
             marker = ">" if i == selected else " "
             value = self._field_value(name)
-            self._add(4 + i, 2, f"{marker} {title:<20} {value}", curses.A_REVERSE if i == selected else 0)
-
-        self._draw_phase_dashboard(20, 0, max(4, h - 24), max(30, min(w - 1, w // 2)))
-
-        right_x = max(32, w // 2 + 1)
-        self._box(2, right_x, min(9, h - 4), max(28, w - right_x - 1), "Channels")
-        for i, ch in enumerate(self.channels[:5]):
-            status = "online" if ch["available"] else "offline"
-            color = self._color(2 if ch["available"] else 4)
-            self._add(4 + i, right_x + 2, f"{ch['id']:<18} {status:<8} bit {ch['bit']}", color)
-
-        classifier_y = 11
-        classifier_h = 8
-        self._box(classifier_y, right_x, classifier_h, max(28, w - right_x - 1), "Classifier")
-        for i, line in enumerate(classifier_summary_lines(self.classifier, self.config.auto_detect)[:classifier_h - 2]):
-            color = self._color(2 if self.classifier is not None else 3)
-            self._add(classifier_y + 2 + i, right_x + 2, line, color if i == 0 else 0)
-
-        scene_y = 20
+            attr = curses.A_REVERSE if i == selected else 0
+            self._add(y + 3 + i, 2, f"{marker} {title:<18} {value}", attr)
+        right_x = left_w + 1
+        right_w = max(4, w - right_x - 1)
+        self._box(y, right_x, 9, right_w, "Status")
         counts = summarize_scene_counts(self.scenes)
-        self._box(scene_y, right_x, max(4, h - scene_y - 4), max(28, w - right_x - 1), f"Project scenes ({len(self.scenes)})")
-        self._add(scene_y + 1, right_x + 2, f"baseline {counts['baseline']} | user {counts['user']} | other {counts['other']}")
-        visible_scenes = self.scenes[-max(1, h - scene_y - 7):]
-        if visible_scenes:
-            for i, scene in enumerate(visible_scenes):
-                label = str(scene.get("label", "unknown"))[:18]
-                accepted = "ok" if scene.get("accepted", False) else "review"
-                confidence = scene.get("quality", {}).get("confidence", "?") if isinstance(scene.get("quality"), dict) else "?"
-                self._add(scene_y + 3 + i, right_x + 2, f"{scene.get('scene_id', '?'):<13} {label:<18} {accepted:<6} {confidence}")
-        else:
-            self._add(scene_y + 3, right_x + 2, "No scenes yet. New captures will land here.")
+        self._add(y + 2, right_x + 2, f"scenes {len(self.scenes)} | baseline {counts['baseline']} | user {counts['user']} | other {counts['other']}")
+        baseline_text = "not trained" if self.baseline is None else f"{self.baseline.scene_count} baseline scenes"
+        classifier_text = "not trained" if self.classifier is None else f"{self.classifier.scene_count} scenes"
+        self._add(y + 4, right_x + 2, f"Baseline: {baseline_text}")
+        self._add(y + 5, right_x + 2, f"Classifier: {classifier_text}")
+        self._add(y + 7, right_x + 2, "Press c to start capture")
 
-        self._add(h - 3, 2, "1-7 phases | t train | v validate | w watcher | e export | c starts | q exits")
-        self.screen.refresh()
+        notes_y = y + 10
+        notes_h = max(4, h - notes_y - 4)
+        self._box(notes_y, right_x, notes_h, right_w, "Notes")
+        self._add_wrapped(notes_y + 2, right_x + 2, self.config.notes or "(no notes)", max(1, right_w - 4), max(1, notes_h - 3))
+
+    def _draw_scenes_tab(self, y: int, h: int, w: int) -> None:
+        list_w = max(28, min(w - 2, w // 2))
+        detail_x = list_w + 1
+        detail_w = max(4, w - detail_x - 1)
+        panel_h = max(4, h - y - 4)
+        self._box(y, 0, panel_h, list_w, f"Scenes ({len(self.scenes)})")
+        self._box(y, detail_x, panel_h, detail_w, "Scene detail")
+        visible_rows = max(1, panel_h - 4)
+        self._ensure_scene_visible(visible_rows)
+        self._add(y + 1, 2, "Scene ID      Label                 Status Conf")
+        rows = self.scenes[self.scene_scroll:self.scene_scroll + visible_rows]
+        for i, scene in enumerate(rows):
+            actual_index = self.scene_scroll + i
+            attr = curses.A_REVERSE if actual_index == self.scene_index else 0
+            quality = scene.get("quality", {})
+            confidence = quality.get("confidence", "?") if isinstance(quality, dict) else "?"
+            accepted = "ok" if scene.get("accepted", False) else "review"
+            label = str(scene.get("label", "unknown"))[:20]
+            self._add(y + 3 + i, 2, f"{scene.get('scene_id', '?'):<13} {label:<20} {accepted:<6} {confidence}", attr)
+        if not self.scenes:
+            self._add(y + 3, 2, "No scenes recorded yet.")
+            return
+        scene = self.scenes[max(0, min(self.scene_index, len(self.scenes) - 1))]
+        self._draw_scene_detail(scene, y + 2, detail_x + 2, detail_w - 4, panel_h - 3)
+
+    def _draw_scene_detail(self, scene: dict[str, object], y: int, x: int, width: int, max_lines: int) -> None:
+        quality = scene.get("quality", {})
+        quality = quality if isinstance(quality, dict) else {}
+        lines = scene_detail_lines(scene)
+        row = y
+        for line in lines[:max(0, max_lines - 5)]:
+            self._add(row, x, line)
+            row += 1
+        notes_lines = max(1, y + max_lines - row)
+        self._add(row, x, "Notes:")
+        row += 1
+        self._add_wrapped(row, x, str(scene.get("notes") or "(no notes)"), width, notes_lines)
+
+    def _draw_channels_tab(self, y: int, h: int, w: int) -> None:
+        panel_h = max(4, h - y - 4)
+        self._box(y, 0, panel_h, w - 1, "Channels")
+        self._add(y + 1, 2, "ID                         Name                         Bit Rate  Status")
+        row = y + 3
+        for ch in self.channels:
+            if row >= y + panel_h - 1:
+                break
+            status = "online" if ch.get("available") else "offline"
+            color = self._color(2 if ch.get("available") else 4)
+            line = f"{ch.get('id', ''):<26} {str(ch.get('name', '')):<28} {ch.get('bit', '')!s:<3} {ch.get('rate_hz', '')!s:<5} {status}"
+            self._add(row, 2, line, color)
+            row += 1
+            reason = str(ch.get("reason", ""))
+            if reason and reason != "ok" and row < y + panel_h - 1:
+                self._add(row, 4, reason[:max(1, w - 8)], self._color(3))
+                row += 1
+
+    def _draw_learn_tab(self, y: int, h: int, w: int) -> None:
+        panel_h = max(4, h - y - 4)
+        self._box(y, 0, panel_h, w - 1, "Learn")
+        if self.baseline is None:
+            self._add(y + 2, 2, "Baseline model not trained. Press t to train.")
+            return
+        self._add(y + 2, 2, f"Baseline scenes: {self.baseline.scene_count}")
+        self._add(y + 3, 2, f"Trained: {self.baseline.trained_utc}")
+        self._add(y + 4, 2, f"Threshold: {self.baseline.threshold:g}")
+        self._add(y + 6, 2, "Channel                         center          MAD          p95          p99")
+        for i, (channel, profile) in enumerate(sorted(self.baseline.channels.items())[:max(1, panel_h - 9)]):
+            self._add(y + 8 + i, 2, profile_line(channel, profile))
+
+    def _draw_classify_tab(self, y: int, h: int, w: int) -> None:
+        panel_h = max(4, h - y - 4)
+        self._box(y, 0, panel_h, w - 1, "Classify")
+        for i, line in enumerate(classifier_summary_lines(self.classifier, self.config.auto_detect)[:max(1, panel_h - 3)]):
+            color = self._color(2 if self.classifier is not None else 3)
+            self._add(y + 2 + i, 2, line, color if i == 0 else 0)
+        if self.classifier is not None:
+            row = y + 9
+            self._add(row, 2, "Label counts:")
+            for i, (label, count) in enumerate(sorted(self.classifier.label_counts.items(), key=lambda item: (-item[1], item[0]))[:max(1, h - row - 4)]):
+                self._add(row + 2 + i, 4, f"{label}: {count}")
+
+    def _draw_watcher_tab(self, y: int, h: int, w: int) -> None:
+        panel_h = max(4, h - y - 4)
+        self._box(y, 0, panel_h, w - 1, "Watcher")
+        self._add(y + 2, 2, f"Status: {self.watcher_summary}")
+        self._add(y + 3, 2, "Press w to run a watcher scan.")
+        self._add(y + 5, 2, "Recent events:")
+        events = read_recent_watcher_events(self.config.project_name, max(1, panel_h - 8))
+        for i, event in enumerate(events):
+            line = f"{event.get('event', '?')} scene={event.get('scene_id', '?')} score={event.get('anomaly_score', '?')} channel={event.get('channel', '?')} pred={event.get('classifier_prediction', '')}"
+            self._add(y + 7 + i, 4, line)
+
+    def _draw_orbiters_tab(self, y: int, h: int, w: int) -> None:
+        panel_h = max(4, h - y - 4)
+        self._box(y, 0, panel_h, w - 1, "Orbiters")
+        status = gemma_edge_status()
+        self._add(y + 2, 2, f"Gemma Edge: {'on' if status['enabled'] else 'off'} | {status['model']}")
+        rows = read_recent_orbiter_summaries(project_path(self.config.project_name), 4)
+        if not rows:
+            self._add(y + 4, 2, "No orbiter summaries yet.")
+            return
+        row = y + 4
+        for summary in rows:
+            if row >= y + panel_h - 2:
+                break
+            prediction = dict(summary.get("classifier_prediction", {})) if isinstance(summary.get("classifier_prediction"), dict) else {}
+            self._add(row, 2, f"{summary.get('scene_id', '?')} anomaly={summary.get('anomaly_score', '?')} pred={prediction.get('label', '?')}")
+            row += 1
+            row += self._add_wrapped(row, 4, str(summary.get("summary") or "(no summary)"), max(1, w - 8), max(1, y + panel_h - 2 - row))
+
+    def _draw_transfer_tab(self, y: int, h: int, w: int) -> None:
+        panel_h = max(4, h - y - 4)
+        self._box(y, 0, panel_h, w - 1, "Transfer")
+        self._add(y + 2, 2, f"Bundle path: {transfer_bundle_path(self.config.project_name)}")
+        self._add(y + 4, 2, f"Last export: {self.transfer_summary}")
+        self._add(y + 6, 2, "Press e to export a local transfer bundle.")
+
+    def _draw_validate_tab(self, y: int, h: int, w: int) -> None:
+        panel_h = max(4, h - y - 4)
+        self._box(y, 0, panel_h, w - 1, "Validate")
+        self._add(y + 2, 2, f"Last validation: {self.validation_summary}")
+        self._add(y + 3, 2, "Press v to validate the dataset.")
+        result = self.last_validation_result
+        if result is None:
+            return
+        self._add(y + 5, 2, f"Total {result.total_scenes} | Valid {result.valid_scenes} | Errors {result.error_count} | Warnings {result.warning_count}")
+        row = y + 7
+        for scene in result.scenes:
+            for error in scene.errors:
+                if row >= y + panel_h - 2:
+                    return
+                self._add(row, 4, f"{error.severity} {scene.scene_id} [{error.check}] {error.message}")
+                row += 1
+
+    def _draw_help_tab(self, y: int, h: int, w: int) -> None:
+        panel_h = max(4, h - y - 4)
+        self._box(y, 0, panel_h, w - 1, "Help")
+        text = (
+            "Tabs: Record configures captures; Scenes inspects recorded scene metadata; Channels shows signal adapters; "
+            "Learn and Classify show trained local models; Watcher runs anomaly scans; Orbiters shows local evidence summaries; "
+            "Transfer exports local bundles; Validate checks dataset health. Hotkeys: TAB next tab, Shift+TAB or left previous tab, "
+            "1-0 jump tabs, c start recording from Record, t train, v validate, w watcher, e export, q exit setup. "
+            "Scene modes: user scenes need a person during action; baseline scenes mean no intentional event; activity scenes are controlled machine-internal labels. "
+            "Pre-roll is control time, action is the labeled window, post-roll is settling time. dSense is local substrate-signal capture and should not be overinterpreted."
+        )
+        self._add_wrapped(y + 2, 2, text, max(1, w - 4), max(1, panel_h - 3))
+
+    def _cycle_tab(self, direction: int) -> None:
+        self.tab_index = tab_index_delta(self.tab_index, direction)
+
+    def _move_scene_selection(self, delta: int) -> None:
+        if not self.scenes:
+            self.scene_index = 0
+            self.scene_scroll = 0
+            return
+        self.scene_index = max(0, min(len(self.scenes) - 1, self.scene_index + delta))
+
+    def _ensure_scene_visible(self, visible_rows: int) -> None:
+        if self.scene_index < self.scene_scroll:
+            self.scene_scroll = self.scene_index
+        elif self.scene_index >= self.scene_scroll + visible_rows:
+            self.scene_scroll = self.scene_index - visible_rows + 1
+        self.scene_scroll = max(0, min(self.scene_scroll, max(0, len(self.scenes) - visible_rows)))
 
     def _draw_phase_dashboard(self, y: int, x: int, h: int, w: int) -> None:
         phases = ["Record", "Learn", "Classify", "Channels", "Watcher", "Orbiters", "Transfer"]
@@ -278,7 +494,10 @@ class SceneRecorderTUI:
             if not scenarios:
                 return "custom"
             idx = self.config.scenario_index % len(scenarios)
-            return f"{idx + 1}/{len(scenarios)} {scenarios[idx].label}"
+            scenario = scenarios[idx]
+            kind = "manual" if scenario.manual else "auto"
+            workload = f" workload:{scenario.workload}" if scenario.workload else ""
+            return f"{idx + 1}/{len(scenarios)} {scenario.label} ({kind}{workload})"
         if name == "record_group":
             return "yes" if self.config.record_group else "no"
         if name == "auto_detect":
@@ -323,6 +542,7 @@ class SceneRecorderTUI:
         self.config.action = scenario.action_seconds
         self.config.post_roll = scenario.post_roll
         self.config.notes = scenario.notes
+        self.config.workload_id = scenario.workload
 
     def _capture_queue(self) -> list[object | None]:
         if self.config.record_group:
@@ -371,7 +591,7 @@ class SceneRecorderTUI:
         detector = HeuristicEventDetector(self.config.tick_hz, learned_baseline=learned_baseline, threshold=threshold)
         self.detector_state = detector.state
 
-        def progress(update: dict[str, object]) -> list[dict[str, object]]:
+        def ui_progress(update: dict[str, object]) -> list[dict[str, object]]:
             self.latest = update
             elapsed_ms = int(update.get("elapsed_ms", 0))
             expected = int(update.get("expected", 1))
@@ -404,6 +624,20 @@ class SceneRecorderTUI:
                 self._draw_recording(take)
             return [*detected, *marked]
 
+        composed_progress = workload_progress_callback(
+            self.config.workload_id,
+            self.config.pre_roll,
+            self.config.action,
+            ui_progress,
+        )
+
+        def progress(update: dict[str, object]) -> list[dict[str, object]]:
+            events = (composed_progress(update) if composed_progress is not None else ui_progress(update)) or []
+            for event in events:
+                if event.get("source") == "workload":
+                    self.live_events.append(dict(event))
+            return events
+
         scene = record_scene(
             scene_dir,
             scene_id,
@@ -416,6 +650,13 @@ class SceneRecorderTUI:
             self.config.notes,
             progress_callback=progress,
         )
+        if self.config.workload_id:
+            scene["scenario"] = {
+                "mode": self.config.mode,
+                "manual": False,
+                "automatable": True,
+                "workload": self.config.workload_id,
+            }
         self.screen.nodelay(False)
         return scene
 
@@ -544,6 +785,7 @@ class SceneRecorderTUI:
 
     def _validate_project_summary(self) -> str:
         result = validate_dataset(self.config.project_name)
+        self.last_validation_result = result
         return f"{result.valid_scenes}/{result.total_scenes} valid, {result.error_count} errors, {result.warning_count} warnings"
 
     def _run_watcher_summary(self) -> str:
@@ -637,6 +879,12 @@ class SceneRecorderTUI:
         except curses.error:
             pass
 
+    def _add_wrapped(self, y: int, x: int, text: str, width: int, max_lines: int, attr: int = 0) -> int:
+        lines = wrap_text(text, width)[:max(0, max_lines)]
+        for i, line in enumerate(lines):
+            self._add(y + i, x, line, attr)
+        return len(lines)
+
     def _color(self, pair: int) -> int:
         return curses.color_pair(pair) if curses.has_colors() else 0
 
@@ -669,6 +917,49 @@ def summarize_scene_counts(scenes: list[dict[str, object]]) -> dict[str, int]:
         else:
             counts["other"] += 1
     return counts
+
+
+def wrap_text(text: str, width: int) -> list[str]:
+    cleaned = str(text or "").strip() or "(no notes)"
+    if width <= 1:
+        return [cleaned[:1] or " "]
+    lines: list[str] = []
+    for paragraph in cleaned.splitlines() or [cleaned]:
+        wrapped = textwrap.wrap(paragraph, width=width, break_long_words=True, break_on_hyphens=False) or [""]
+        lines.extend(wrapped)
+    return lines or ["(no notes)"]
+
+
+def tab_index_delta(index: int, delta: int) -> int:
+    if not TABS:
+        return 0
+    return (index + delta) % len(TABS)
+
+
+def scene_detail_lines(scene: dict[str, object]) -> list[str]:
+    quality = scene.get("quality", {})
+    quality = quality if isinstance(quality, dict) else {}
+    return [
+        f"Scene ID: {scene.get('scene_id', '?')}",
+        f"Label: {scene.get('label', '?')}",
+        f"Created: {scene.get('created_utc', '?')}",
+        f"Duration: {scene.get('duration_ms', '?')} ms | tick {scene.get('tick_hz', '?')} Hz",
+        f"Window: pre {scene.get('pre_roll_ms', '?')} ms | action {scene.get('action_start_ms', '?')}-{scene.get('action_end_ms', '?')} ms | post {scene.get('post_roll_ms', '?')} ms",
+        f"Accepted: {scene.get('accepted', False)} | events {scene.get('user_event_count', 0)}",
+        f"Quality: confidence {quality.get('confidence', '?')} | frames {quality.get('actual_frames', '?')}/{quality.get('expected_frames', '?')}",
+        f"Checksum: {quality.get('checksum_ok', '?')} | frame size {quality.get('frame_size_valid', '?')}",
+        f"Availability mask: {quality.get('channel_availability_mask', '?')}",
+    ]
+
+
+def profile_line(channel: str, profile: dict[str, float]) -> str:
+    return (
+        f"{channel:<30} "
+        f"{float(profile.get('center', 0.0)):>12.3g} "
+        f"{float(profile.get('mad', 0.0)):>12.3g} "
+        f"{float(profile.get('p95', 0.0)):>12.3g} "
+        f"{float(profile.get('p99', 0.0)):>12.3g}"
+    )
 
 
 def classifier_summary_lines(model: SceneClassifierModel | None, auto_detect: bool) -> list[str]:

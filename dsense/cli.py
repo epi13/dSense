@@ -22,10 +22,12 @@ from .replay import (
     resolve_scene_dir,
 )
 from .recorder import record_scene
+from .scenarios import SCENARIO_GROUPS, Scenario, all_scenarios
 from .tui import CaptureConfig, run_tui
 from .trace import export_trace, trace_path, viewer_path, write_scene_viewer
 from .wizard import guided_scene
-from .utils.files import read_json
+from .workloads import valid_workload_ids, workload_progress_callback
+from .utils.files import read_json, write_json
 from .autotest import validate_dataset, print_validation_report
 from .transfer import compare_transfer_bundle, export_transfer_bundle, transfer_bundle_path
 from .watcher import label_candidate, run_rolling_watcher, run_watcher_scan
@@ -48,6 +50,102 @@ def cmd_record_baseline(args):
     groups = parse_channel_groups(args.channels)
     scene = record_scene(project_path(args.project_name) / "scenes" / scene_id, scene_id, "baseline_idle", args.duration, args.tick_hz, 0, args.duration, 0, args.notes, channel_groups=groups)
     print(f"Recorded {scene_id}: confidence={scene['quality']['confidence']}")
+
+
+def cmd_auto_scenes(args):
+    init_project(args.project_name)
+    selected = _select_auto_scenarios(args.group, args.include, args.exclude)
+    if not selected:
+        raise SystemExit("No automatable scenarios selected.")
+    total = len(selected) * max(1, args.repeat)
+    print(f"Automatic scene batch: project={args.project_name} scenes={len(selected)} repeats={args.repeat} total={total}")
+    for scenario in selected:
+        workload_text = f" workload={scenario.workload}" if scenario.workload else ""
+        print(f"  {scenario.label} [{scenario.mode}]{workload_text} {scenario.duration:g}s")
+    if not args.yes:
+        answer = input("Start automatic capture batch? [y/N]: ").strip().lower()
+        if answer not in {"y", "yes"}:
+            raise SystemExit("Cancelled.")
+
+    groups = parse_channel_groups(args.channels)
+    results: list[dict[str, object]] = []
+    for repeat_index in range(1, max(1, args.repeat) + 1):
+        for scenario in selected:
+            scene_id = allocate_scene_id(args.project_name)
+            scene_dir = project_path(args.project_name) / "scenes" / scene_id
+            action = scenario.action_seconds
+            notes = args.notes or scenario.notes
+            callback = workload_progress_callback(scenario.workload, scenario.pre_roll, action)
+            print(f"Recording {scene_id} {scenario.label} repeat {repeat_index}/{args.repeat}")
+            scene = record_scene(
+                scene_dir,
+                scene_id,
+                scenario.label,
+                scenario.duration,
+                args.tick_hz,
+                scenario.pre_roll,
+                action,
+                scenario.post_roll,
+                notes,
+                mode=scenario.mode,
+                progress_callback=callback,
+                channel_groups=groups,
+            )
+            scene["accepted"] = True if args.yes else _prompt_keep_scene(scene)
+            scene["scenario"] = {
+                "mode": scenario.mode,
+                "manual": scenario.manual,
+                "automatable": scenario.automatable,
+                "workload": scenario.workload,
+            }
+            write_json(scene_dir / "scene.json", scene)
+            results.append(scene)
+            print(f"Recorded {scene_id}: confidence={scene['quality']['confidence']} accepted={scene['accepted']}")
+
+    _print_auto_scene_training_hint(args.project_name)
+    result = validate_dataset(args.project_name)
+    print(f"Validation: {result.valid_scenes}/{result.total_scenes} valid, errors={result.error_count}, warnings={result.warning_count}")
+
+
+def _select_auto_scenarios(group: str, include: str, exclude: str) -> list[Scenario]:
+    labels = {scenario.label: scenario for scenario in all_scenarios()}
+    include_labels = _split_csv(include)
+    exclude_labels = set(_split_csv(exclude))
+    if include_labels:
+        missing = [label for label in include_labels if label not in labels]
+        if missing:
+            raise SystemExit(f"Unknown scenario label(s): {', '.join(missing)}")
+        candidates = [labels[label] for label in include_labels]
+    else:
+        group_names = ["baseline", "activity"] if group == "auto" else [group]
+        candidates = [scenario for name in group_names for scenario in SCENARIO_GROUPS.get(name, [])]
+    selected = [scenario for scenario in candidates if scenario.automatable and scenario.label not in exclude_labels]
+    invalid = [scenario.label for scenario in selected if scenario.workload is not None and scenario.workload not in valid_workload_ids()]
+    if invalid:
+        raise SystemExit(f"Scenario(s) reference unknown workload ids: {', '.join(invalid)}")
+    return selected
+
+
+def _split_csv(value: str) -> list[str]:
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _prompt_keep_scene(scene: dict[str, object]) -> bool:
+    answer = input(f"Keep {scene['scene_id']} ({scene['label']})? [Y/n]: ").strip().lower()
+    return answer not in {"n", "no"}
+
+
+def _print_auto_scene_training_hint(project_name: str) -> None:
+    try:
+        baseline_model = train_and_save_project_baseline(project_name)
+        classifier_model = train_and_save_project_classifier(project_name)
+    except (OSError, ValueError) as exc:
+        print(f"Training skipped: {exc}")
+        print(f"Run: python -m dsense train-baseline {project_name}")
+        print(f"Run: python -m dsense train-classifier {project_name}")
+        return
+    print(f"Trained baseline: {baseline_model.scene_count} baseline scenes")
+    print(f"Trained classifier: {classifier_model.scene_count} scenes")
 
 
 def cmd_scene(args):
@@ -355,6 +453,17 @@ def build_parser():
     sp = sub.add_parser("doctor"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to check (default: {DEFAULT_PROJECT})"); sp.set_defaults(func=cmd_doctor)
     sp = sub.add_parser("scan"); sp.add_argument("--advanced", action="store_true", help="include linux and experimental adapters"); sp.set_defaults(func=cmd_scan)
     sp = sub.add_parser("record-baseline"); sp.add_argument("project_name"); sp.add_argument("--duration", type=float, default=30); sp.add_argument("--tick-hz", type=int, default=100); sp.add_argument("--notes", default=""); sp.add_argument("--channels", default="portable", help="channel groups, e.g. portable or portable,linux"); sp.set_defaults(func=cmd_record_baseline)
+    sp = sub.add_parser("auto-scenes")
+    sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to record into (default: {DEFAULT_PROJECT})")
+    sp.add_argument("--group", choices=["auto", "baseline", "activity"], default="auto", help="automatable preset group to record")
+    sp.add_argument("--repeat", type=int, default=1, help="number of repeats per selected scenario")
+    sp.add_argument("--include", default="", help="comma-separated scenario labels to include")
+    sp.add_argument("--exclude", default="", help="comma-separated scenario labels to exclude")
+    sp.add_argument("--tick-hz", type=int, default=100)
+    sp.add_argument("--channels", default="portable", help="channel groups, e.g. portable or portable,linux")
+    sp.add_argument("--notes", default="", help="override scenario notes for this batch")
+    sp.add_argument("--yes", action="store_true", help="start and accept captures without prompts")
+    sp.set_defaults(func=cmd_auto_scenes)
     sp = sub.add_parser("scene"); sp.add_argument("project_name"); sp.add_argument("--label", required=True); sp.add_argument("--duration", type=float); sp.add_argument("--pre-roll", type=float, default=2); sp.add_argument("--action", type=float, default=5); sp.add_argument("--post-roll", type=float, default=3); sp.add_argument("--repeat", type=int, default=1); sp.add_argument("--notes", default=""); sp.add_argument("--tick-hz", type=int, default=100); sp.add_argument("--channels", default="portable", help="channel groups, e.g. portable or portable,linux"); sp.add_argument("--yes", action="store_true", help="accept captures without prompt"); sp.add_argument("--tui", action="store_true", help="record with the full-screen interaction recorder"); sp.set_defaults(func=cmd_scene)
     sp = sub.add_parser("tui"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to open (default: {DEFAULT_PROJECT})"); sp.add_argument("--label", default="user_interaction"); sp.add_argument("--duration", type=float); sp.add_argument("--pre-roll", type=float, default=2); sp.add_argument("--action", type=float, default=5); sp.add_argument("--post-roll", type=float, default=3); sp.add_argument("--repeat", type=int, default=1); sp.add_argument("--notes", default=""); sp.add_argument("--tick-hz", type=int, default=100); sp.set_defaults(func=cmd_tui)
     sp = sub.add_parser("list-scenes"); sp.add_argument("project_name"); sp.set_defaults(func=cmd_list)

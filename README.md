@@ -68,6 +68,8 @@ python -m dsense init demo_lab
 python -m dsense scan
 python -m dsense scan --advanced
 python -m dsense record-baseline demo_lab --duration 30
+python -m dsense auto-scenes base --group baseline --repeat 3 --yes
+python -m dsense auto-scenes base --group activity --repeat 2 --yes
 python -m dsense tui --label person_walks_front_left_to_right --duration 10 --pre-roll 2 --action 5 --post-roll 3 --repeat 3
 python -m dsense scene demo_lab --label person_walks_front_left_to_right --duration 10 --pre-roll 2 --action 5 --post-roll 3 --repeat 3
 python -m dsense scene demo_lab --label linux_activity --duration 5 --channels portable,linux --yes
@@ -87,6 +89,45 @@ The default tick rate is 100 Hz. Higher rates are allowed with `--tick-hz`, but 
 
 For non-interactive captures, `dsense scene` also provides `--yes` to keep captures without prompting.
 
+## Scene presets and automatic capture
+
+dSense presets are split into three groups:
+
+- `user`: manual interaction labels such as approach direction, walk-by direction, sitting down, leaving, typing, mouse use, phone placement, door/object movement, and table taps. These require a person to perform the action during the action window.
+- `baseline`: automatic recordings of "nothing intentional is happening" states such as quiet idle, screen-on idle, charging, battery, network-on, post-startup, and warmed-up idle.
+- `activity`: controlled machine-internal labels such as bounded CPU work, temp-file metadata or write activity, modest memory allocation, deterministic Python loops, mixed CPU/disk work, and a no-op automation control.
+
+Manual capture remains available through the TUI or guided scene command:
+
+```bash
+python -m dsense tui base
+python -m dsense scene base --label user_walk_left_to_right --duration 10 --pre-roll 2 --action 5 --post-roll 3
+```
+
+Baseline and activity presets can be captured without user interaction:
+
+```bash
+python -m dsense auto-scenes base --group baseline --yes
+python -m dsense auto-scenes base --group activity --yes
+python -m dsense auto-scenes base --group baseline --repeat 3 --tick-hz 100 --yes
+python -m dsense auto-scenes base --include baseline_idle_quiet,activity_cpu_light --yes
+python -m dsense auto-scenes base --exclude activity_disk_write_tempfile --yes
+```
+
+Activity workloads run only during the configured action window. They are pure Python standard-library helpers, use local temporary files when disk activity is needed, clean up afterward, and do not use microphone, camera, RF, network, or external AI calls. Treat these scenes as controlled machine-internal labels, not proof of external sensing.
+
+Recommended first dataset sequence:
+
+```bash
+python -m dsense init base
+python -m dsense auto-scenes base --group baseline --repeat 3 --yes
+python -m dsense auto-scenes base --group activity --repeat 2 --yes
+python -m dsense tui base
+python -m dsense train-baseline base
+python -m dsense train-classifier base
+python -m dsense validate base --verbose
+```
+
 `dsense doctor` checks Python version, dataset folder state, terminal/TUI support, write permissions, and channel availability. Use `python -m dsense validate base --verbose` before training or pass `--require-valid` to training/export commands so broken captures fail clearly.
 
 Channel groups keep dSense portable by default. `portable` is the default group. `linux` adds optional `/proc` and thermal/sysfs adapters when readable. `experimental` currently reports the eBPF adapter as unavailable unless a future implementation is installed. Use `dsense scan --advanced` to see group and permission status, and `dsense scene base --channels portable,linux ...` to opt into Linux telemetry for a capture.
@@ -95,7 +136,9 @@ Channel groups keep dSense portable by default. `portable` is the default group.
 
 Use `python -m dsense` or `python -m dsense tui` for the full-screen recorder. By default it opens the base project at `datasets/base/`, loads all existing scenes from that project, and stores new captures there. To use another project, pass it explicitly, for example `python -m dsense tui demo_lab`.
 
-The TUI starts with an editable capture setup, shows detected channels, baseline/classifier status, the seven phase dashboard panels, and existing project scenes. It trains or refreshes local baseline/classifier models from accepted scenes, then records with a live overview of frame progress, current phase, timing drift, process estimate, and marker count. The setup screen includes preset groups for `user`, `baseline`, and `activity` scenes.
+The TUI opens as a tabbed local control panel. The tab bar includes `Record`, `Scenes`, `Channels`, `Learn`, `Classify`, `Watcher`, `Orbiters`, `Transfer`, `Validate`, and `Help`. The `Record` tab keeps the editable capture setup with preset groups for `user`, `baseline`, and `activity` scenes. `Scenes` lets you browse recorded scenes and inspect wrapped scene notes. `Channels` shows adapter status. `Learn` and `Classify` show local model state. `Watcher`, `Orbiters`, `Transfer`, and `Validate` expose the project tools without leaving the terminal.
+
+It trains or refreshes local baseline/classifier models from accepted scenes, then records with a live overview of frame progress, current phase, timing drift, process estimate, and marker count.
 
 The baseline model is stored at `datasets/<project_name>/exports/baseline_model.json`. The classifier is stored at `datasets/<project_name>/exports/classifier.json`. They use accepted scene previews to build baseline channel profiles and label summaries. They are retrained automatically when the TUI opens and after new accepted recordings are added, so automatic event detection improves as the project grows. You can retrain them explicitly with:
 
@@ -137,7 +180,9 @@ Recommended repeatability set:
 
 On the setup screen:
 
-- `1`-`7` switches between phase panels: Record, Learn, Classify, Channels, Watcher, Orbiters, Transfer
+- `TAB` switches to the next tab
+- `Shift+TAB` or left arrow switches to the previous tab
+- `1`-`0` jumps directly to tabs from `Record` through `Help`
 - `m` cycles scene mode: user interactions, baseline system scenes, and system activity scenes
 - `p` / `o` cycles presets inside the current mode
 - `g` toggles batch recording for the whole current preset group
@@ -147,8 +192,10 @@ On the setup screen:
 - `w` runs a local watcher scan and writes watcher/orbiter artifacts
 - `e` exports a local transfer bundle
 - `Enter` edits the selected field or cycles mode/preset/toggle fields
-- `c` starts recording
+- `c` starts recording from the `Record` tab
 - `q` exits the TUI from the setup screen
+
+The `Help` tab summarizes the recommended workflow, scene-mode meanings, and the pre-roll/action/post-roll timing model. dSense remains a local substrate-signal capture tool; labels and summaries are evidence for controlled experiments, not claims of external certainty.
 
 During recording:
 

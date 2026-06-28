@@ -12,6 +12,9 @@ class Scenario:
     pre_roll: float = 0.0
     action: float | None = None
     post_roll: float = 0.0
+    mode: str = "user"
+    manual: bool = True
+    workload: str | None = None
 
     @property
     def action_seconds(self) -> float:
@@ -19,54 +22,51 @@ class Scenario:
             return self.action
         return max(0.0, self.duration - self.pre_roll - self.post_roll)
 
+    @property
+    def automatable(self) -> bool:
+        return not self.manual
+
+
+USER_INTERACTION_SCENARIOS = [
+    Scenario("user_approach_from_left", 10, "Person walks into sensing area from the left side of the computer.", "Start outside the sensing area on the left, enter during the action window.", 2, 5, 3),
+    Scenario("user_approach_from_right", 10, "Person walks into sensing area from the right side of the computer.", "Start outside the sensing area on the right, enter during the action window.", 2, 5, 3),
+    Scenario("user_walk_left_to_right", 10, "Person crosses in front of the computer left-to-right.", "Walk past the computer at a natural pace during the action window.", 2, 5, 3),
+    Scenario("user_walk_right_to_left", 10, "Person crosses in front of the computer right-to-left.", "Walk past the computer at a natural pace during the action window.", 2, 5, 3),
+    Scenario("user_stand_near_computer", 10, "Person stands still near the computer during action window.", "Stand near the computer without touching it.", 2, 5, 3),
+    Scenario("user_sit_down_at_computer", 12, "Person approaches and sits down at the computer.", "Approach and sit during the action window.", 2, 7, 3),
+    Scenario("user_leave_computer", 10, "Person gets up and walks away.", "Start near the computer, then leave during the action window.", 2, 5, 3),
+    Scenario("user_typing_short_burst", 10, "User types steadily during action window.", "Type normally and steadily during the action window.", 2, 5, 3),
+    Scenario("user_typing_hard_burst", 10, "User types harder/faster than normal during action window.", "Type with higher force or pace than normal.", 2, 5, 3),
+    Scenario("user_mouse_activity", 10, "User moves/clicks mouse during action window.", "Move and click the mouse naturally during the action window.", 2, 5, 3),
+    Scenario("user_phone_near_left_side", 10, "Phone is brought near the left side of the computer.", "Move a phone near the left side during action, then hold it still briefly.", 2, 5, 3),
+    Scenario("user_phone_near_right_side", 10, "Phone is brought near the right side of the computer.", "Move a phone near the right side during action, then hold it still briefly.", 2, 5, 3),
+    Scenario("user_door_open_close", 12, "Door or nearby object opens/closes during action window.", "Open or close the nearby object once during action.", 2, 7, 3),
+    Scenario("user_table_tap_light", 8, "Light tap/vibration near the computer.", "Tap the table lightly once or twice during action.", 2, 3, 3),
+    Scenario("user_table_tap_heavy", 8, "Stronger tap/vibration near the computer.", "Tap firmly enough to create a controlled vibration, without risking hardware.", 2, 3, 3),
+]
+
 
 BASELINE_SCENARIOS = [
-    Scenario("baseline_idle_early_morning", 60, "System just booted or woken, cold, minimal services", "Early morning idle, system at baseline temperature"),
-    Scenario("baseline_idle_daytime", 60, "Mid-day idle, warmed up, normal services running", "Daytime idle after prolonged operation"),
-    Scenario("baseline_idle_evening", 60, "Evening idle, system stable and warm", "Evening idle, system in steady state"),
-    Scenario("baseline_idle_with_fan", 45, "Idle with fan running", "Idle with active cooling. Note fan state."),
-    Scenario("baseline_idle_with_network", 45, "Idle with periodic network activity", "Idle with background network operations"),
-    Scenario("baseline_idle_with_disk_activity", 45, "Idle with occasional disk operations", "Idle with light I/O activity"),
-    Scenario("baseline_low_activity_text_editor", 30, "Text editor open, no typing", "Minimal GUI app running, no input"),
-    Scenario("baseline_low_activity_browser_static", 30, "Browser on static page, no input", "Idle webpage, browser consuming minimal CPU"),
-    Scenario("baseline_high_performance_mode", 45, "High performance power profile", "Power policy set to performance"),
-    Scenario("baseline_power_saver_mode", 45, "Power saver profile", "Power policy set to battery saver or eco mode"),
-    Scenario("baseline_quiet_environment", 30, "Silent room, no ambient vibration", "Quiet environment. No background sounds or vibration."),
-    Scenario("baseline_with_ambient_noise", 30, "Room with background noise", "Ambient background noise present"),
-    Scenario("baseline_immediately_after_boot", 30, "Immediately after system boot", "System freshly booted. Expect initialization patterns."),
-    Scenario("baseline_after_long_idle", 30, "After 30+ minutes idle", "System fully settled after extended idle period"),
-    Scenario("baseline_battery_low", 30, "Laptop on low battery", "Low battery condition. Power limits may be active."),
-    Scenario("baseline_plugged_in", 30, "Laptop plugged in", "Plugged to AC power, no battery constraint"),
-    Scenario("baseline_external_display_connected", 30, "External monitor active", "External GPU/display active, driver in use"),
+    Scenario("baseline_idle_quiet", 12, "Quiet room, no intentional user action.", "Leave the machine untouched during the recording.", 2, 7, 3, mode="baseline", manual=False),
+    Scenario("baseline_idle_screen_on", 12, "Computer awake, screen on, no user interaction.", "Keep the screen awake and avoid input.", 2, 7, 3, mode="baseline", manual=False),
+    Scenario("baseline_idle_after_startup", 12, "Machine recently booted or apps recently opened, but no active user interaction.", "Prepare this state before recording; do not interact during capture.", 2, 7, 3, mode="baseline", manual=False),
+    Scenario("baseline_idle_after_warmup", 12, "Machine has been running for several minutes, no active interaction.", "Use after the system has settled.", 2, 7, 3, mode="baseline", manual=False),
+    Scenario("baseline_idle_charging", 12, "Laptop plugged into power, no intentional user action.", "Plug in power before capture if applicable.", 2, 7, 3, mode="baseline", manual=False),
+    Scenario("baseline_idle_battery", 12, "Laptop on battery, no intentional user action.", "Unplug power before capture if applicable.", 2, 7, 3, mode="baseline", manual=False),
+    Scenario("baseline_idle_network_on", 12, "Normal network connected, no intentional user action.", "Keep normal networking on; avoid deliberate downloads/uploads.", 2, 7, 3, mode="baseline", manual=False),
+    Scenario("baseline_idle_low_light_activity", 12, "Normal background conditions, minor room noise accepted.", "Do not create an intentional event; ordinary background variation is acceptable.", 2, 7, 3, mode="baseline", manual=False),
 ]
 
 
 ACTIVITY_SCENARIOS = [
-    Scenario("baseline_cpu_light", 30, "Light CPU activity", "Single core light computation running"),
-    Scenario("baseline_cpu_moderate", 30, "Moderate CPU activity", "Multi-threaded CPU load at about 50%"),
-    Scenario("baseline_cpu_heavy", 30, "Heavy CPU load", "Sustained high CPU utilization"),
-    Scenario("baseline_memory_pressure", 30, "High memory pressure", "Memory allocation causing swap activity"),
-    Scenario("baseline_io_reads", 30, "Sustained disk reads", "Sequential disk reads from a large file"),
-    Scenario("baseline_io_writes", 30, "Sustained disk writes", "Sequential disk writes to a file"),
-    Scenario("baseline_io_random", 30, "Random disk I/O", "Random access I/O operations"),
-    Scenario("baseline_network_download", 30, "Network download activity", "Downloading file from local or remote source"),
-    Scenario("baseline_network_upload", 30, "Network upload activity", "Uploading file to local or remote destination"),
-    Scenario("baseline_process_spawn", 30, "Frequent process creation", "Spawning and terminating processes repeatedly"),
-    Scenario("baseline_context_switch_heavy", 30, "High context switch rate", "Many threads contending for CPU"),
-    Scenario("baseline_interrupt_driven", 30, "High interrupt/signal rate", "Frequent interrupts from devices"),
-]
-
-
-USER_INTERACTION_SCENARIOS = [
-    Scenario("user_interaction_approach", 10, "User approaches the machine", "User starts away from the machine, approaches during action window", 2, 5, 3),
-    Scenario("user_interaction_leave", 10, "User leaves the machine", "User starts near the machine, leaves during action window", 2, 5, 3),
-    Scenario("person_walks_front_left_to_right", 10, "Walk-by left to right", "Person walks in front of the machine from left to right", 2, 5, 3),
-    Scenario("person_walks_front_right_to_left", 10, "Walk-by right to left", "Person walks in front of the machine from right to left", 2, 5, 3),
-    Scenario("user_sits_down_near_machine", 12, "User sits near machine", "User enters and sits down near the machine", 3, 6, 3),
-    Scenario("phone_near_computer", 10, "Phone moved near computer", "Move phone near the machine during action window", 2, 5, 3),
-    Scenario("door_open_close", 12, "Door opens or closes", "Door movement during action window", 3, 6, 3),
-    Scenario("typing_burst", 10, "Typing burst", "User types during action window", 2, 5, 3),
-    Scenario("mouse_activity", 10, "Mouse activity", "User moves/clicks mouse during action window", 2, 5, 3),
+    Scenario("activity_cpu_light", 10, "Light CPU activity during action window.", "Automatically runs a conservative CPU workload only during action.", 2, 5, 3, mode="activity", manual=False, workload="cpu_light"),
+    Scenario("activity_cpu_heavy", 10, "Heavier CPU activity during action window.", "Automatically runs bounded CPU worker threads only during action.", 2, 5, 3, mode="activity", manual=False, workload="cpu_heavy"),
+    Scenario("activity_disk_stat_burst", 10, "Repeated filesystem metadata/stat calls during action window.", "Automatically stats local temp files only during action.", 2, 5, 3, mode="activity", manual=False, workload="disk_stat_burst"),
+    Scenario("activity_disk_write_tempfile", 10, "Temporary file writes during action window, cleaned up afterward.", "Automatically writes bounded temporary files and cleans them up.", 2, 5, 3, mode="activity", manual=False, workload="disk_write_tempfile"),
+    Scenario("activity_memory_allocate_release", 10, "Allocate and release a modest memory block during action window.", "Automatically allocates and releases modest memory chunks.", 2, 5, 3, mode="activity", manual=False, workload="memory_allocate_release"),
+    Scenario("activity_python_loop", 10, "Deterministic Python compute loop during action window.", "Automatically runs a deterministic Python loop only during action.", 2, 5, 3, mode="activity", manual=False, workload="python_loop"),
+    Scenario("activity_mixed_cpu_disk", 10, "Combined CPU and disk activity.", "Automatically combines bounded CPU and temp-file activity.", 2, 5, 3, mode="activity", manual=False, workload="mixed_cpu_disk"),
+    Scenario("activity_noop_control", 10, "Automatic recording with no artificial workload, used as an automation control.", "Records the same timed automation path without artificial workload.", 2, 5, 3, mode="activity", manual=False, workload="noop"),
 ]
 
 
@@ -75,3 +75,14 @@ SCENARIO_GROUPS = {
     "baseline": BASELINE_SCENARIOS,
     "activity": ACTIVITY_SCENARIOS,
 }
+
+
+def all_scenarios() -> list[Scenario]:
+    return [scenario for scenarios in SCENARIO_GROUPS.values() for scenario in scenarios]
+
+
+def scenario_by_label(label: str) -> Scenario | None:
+    for scenario in all_scenarios():
+        if scenario.label == label:
+            return scenario
+    return None
