@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .manifest import project_path
 from .models.evaluation import predict_from_profiles
-from .models.features import mean_profile, percentile, read_numeric_preview_rows, robust_profile, summarize_rows
+from .models.features import feature_manifest, mean_profile, percentile, read_numeric_preview_rows, robust_profile, summarize_rows
 from .utils.files import ensure_dir, read_json, write_json
 from .utils.timebase import utc_now_iso
 
@@ -21,6 +21,7 @@ class SceneClassifierModel:
     label_counts: dict[str, int]
     detector_baseline: dict[str, dict[str, float]]
     label_profiles: dict[str, dict[str, float]]
+    feature_manifest: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -31,6 +32,7 @@ class SceneClassifierModel:
             "label_counts": self.label_counts,
             "detector_baseline": self.detector_baseline,
             "label_profiles": self.label_profiles,
+            "feature_manifest": self.feature_manifest,
         }
 
 
@@ -40,6 +42,8 @@ def train_project_classifier(project_name: str) -> SceneClassifierModel:
     baseline_rows: dict[str, list[float]] = {}
     label_counts: dict[str, int] = {}
     label_features: dict[str, list[dict[str, float]]] = {}
+    all_features: list[dict[str, float]] = []
+    all_rows: list[dict[str, float]] = []
     baseline_scene_count = 0
 
     for scene_path in sorted((root / "scenes").glob("scene_*/scene.json")):
@@ -60,6 +64,8 @@ def train_project_classifier(project_name: str) -> SceneClassifierModel:
             continue
 
         features = _summarize_rows(rows)
+        all_features.append(features)
+        all_rows.extend(rows)
         scene_rows.append({"scene_id": scene.get("scene_id"), "label": label, "features": features})
         label_counts[label] = label_counts.get(label, 0) + 1
         label_features.setdefault(label, []).append(features)
@@ -88,6 +94,7 @@ def train_project_classifier(project_name: str) -> SceneClassifierModel:
         label_counts=label_counts,
         detector_baseline=detector_baseline,
         label_profiles=label_profiles,
+        feature_manifest=feature_manifest(all_features, all_rows),
     )
 
 
@@ -121,6 +128,7 @@ def load_project_classifier(project_name: str) -> SceneClassifierModel | None:
             str(label): {str(k): float(v) for k, v in dict(profile).items()}
             for label, profile in dict(data.get("label_profiles", {})).items()
         },
+        feature_manifest=dict(data.get("feature_manifest", {})),
     )
 
 

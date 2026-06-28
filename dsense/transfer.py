@@ -5,6 +5,7 @@ from pathlib import Path
 from .baseline import load_project_baseline, train_and_save_project_baseline
 from .classifier import load_project_classifier, train_and_save_project_classifier
 from .manifest import project_path, scan_channels
+from .privacy import redact_transfer_bundle
 from .utils.files import ensure_dir, read_json, write_json
 from .utils.timebase import utc_now_iso
 
@@ -13,8 +14,7 @@ def transfer_bundle_path(project_name: str) -> Path:
     return project_path(project_name) / "exports" / "transfer_bundle.json"
 
 
-def export_transfer_bundle(project_name: str) -> dict[str, object]:
-    root = project_path(project_name)
+def export_transfer_bundle(project_name: str, redact: bool = False) -> dict[str, object]:
     baseline = load_project_baseline(project_name) or train_and_save_project_baseline(project_name)
     classifier = load_project_classifier(project_name) or train_and_save_project_classifier(project_name)
     scenes = _load_project_scenes(project_name)
@@ -29,6 +29,8 @@ def export_transfer_bundle(project_name: str) -> dict[str, object]:
         "channels": scan_channels(),
         "quality": _quality_summary(scenes),
     }
+    if redact:
+        bundle = redact_transfer_bundle(bundle)
     out = transfer_bundle_path(project_name)
     ensure_dir(out.parent)
     write_json(out, bundle)
@@ -36,7 +38,7 @@ def export_transfer_bundle(project_name: str) -> dict[str, object]:
 
 
 def compare_transfer_bundle(project_name: str, bundle_path: Path) -> dict[str, object]:
-    local = export_transfer_bundle(project_name)
+    local = export_transfer_bundle(project_name, redact=False)
     remote = read_json(bundle_path)
     local_channels = {channel["id"] for channel in local.get("channels", []) if channel.get("available")}
     remote_channels = {channel["id"] for channel in remote.get("channels", []) if channel.get("available")}

@@ -17,11 +17,13 @@ ProgressCallback = Callable[[dict[str, object]], list[dict[str, object]] | None]
 def record_scene(scene_dir: Path, scene_id: str, label: str, duration: float, tick_hz: int = 100,
                  pre_roll: float = 0.0, action: float | None = None, post_roll: float = 0.0,
                  notes: str = "", mode: str = "record",
-                 progress_callback: ProgressCallback | None = None) -> dict[str, object]:
+                 progress_callback: ProgressCallback | None = None,
+                 channel_groups: list[str] | tuple[str, ...] | None = None) -> dict[str, object]:
     ensure_dir(scene_dir)
     interval_ns = int(1_000_000_000 / tick_hz)
     expected = max(1, int(round(duration * tick_hz)))
-    channels = default_channels()
+    selected_groups = list(channel_groups or ("portable",))
+    channels = default_channels(selected_groups)
     for ch in channels:
         ch.start()
     rows: list[dict[str, int]] = []
@@ -101,7 +103,8 @@ def record_scene(scene_dir: Path, scene_id: str, label: str, duration: float, ti
     scene = {"scene_id": scene_id, "label": label, "created_utc": utc_now_iso(), "duration_ms": int(duration * 1000), "tick_hz": tick_hz,
              "frame_size_bytes": FRAME_SIZE, "mode": mode, "machine_state": {}, "pre_roll_ms": int(pre_roll * 1000),
              "action_start_ms": action_start_ms, "action_end_ms": action_end_ms, "post_roll_ms": int(post_roll * 1000),
-             "channels": [{"id": c.id, "available": c.available(), "bit": c.bit} for c in channels], "quality": quality_summary,
+             "channel_groups": selected_groups,
+             "channels": [{"id": c.id, "group": getattr(c, "group", "portable"), "available": c.available(), "bit": c.bit} for c in channels], "quality": quality_summary,
              "accepted": True, "notes": notes, "user_event_count": len(user_events)}
     write_json(scene_dir / "scene.json", scene)
     return scene

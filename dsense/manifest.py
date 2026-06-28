@@ -46,13 +46,25 @@ def allocate_scene_id(name: str) -> str:
     return f"scene_{n:06d}"
 
 
-def scan_channels() -> list[dict[str, object]]:
+def scan_channels(advanced: bool = False, groups: list[str] | tuple[str, ...] | None = None) -> list[dict[str, object]]:
     out = []
-    for ch in default_channels():
+    selected_groups = list(groups or (("portable", "linux", "experimental") if advanced else ("portable",)))
+    for ch in default_channels(selected_groups):
         try:
             available = ch.available()
             reason = "ok" if available else "unavailable"
         except Exception as exc:
             available, reason = False, str(exc)
-        out.append({"id": ch.id, "name": ch.name, "rate_hz": ch.rate_hz, "bit": ch.bit, "available": available, "reason": reason})
+        if ch.id == "experimental_ebpf" and not available:
+            reason = "experimental adapter not enabled; requires separate eBPF implementation/permissions"
+        out.append({
+            "id": ch.id,
+            "name": ch.name,
+            "group": getattr(ch, "group", "portable"),
+            "rate_hz": ch.rate_hz,
+            "bit": ch.bit,
+            "available": available,
+            "reason": reason,
+            "permission": "readable" if available else reason,
+        })
     return out

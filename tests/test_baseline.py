@@ -28,4 +28,5 @@ def test_train_and_score_baseline_model(tmp_path, monkeypatch):
     assert model.scene_count == 1
     assert loaded is not None
     assert "sleep_drift_ns" in loaded.channels
+    assert "sleep_drift_ns_slope" in loaded.feature_manifest["features"]
     assert score["status"] == "anomaly"

@@ -3,7 +3,7 @@
 import tempfile
 import json
 from pathlib import Path
-from dsense.autotest import validate_scene, validate_dataset, ValidationError
+from dsense.autotest import validate_scene, validate_dataset
 from dsense.frame import build_frame, FRAME_SIZE
 from dsense.utils.files import write_json
 

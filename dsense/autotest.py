@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .frame import parse_frame, FRAME_SIZE, verify_frame
+from .frame import FRAME_SIZE, verify_frame
 from .manifest import project_path
 from .utils.files import read_json
 
@@ -303,14 +303,14 @@ def print_validation_report(result: DatasetValidationResult, verbose: bool = Fal
     print(f"dSense Dataset Validation Report: {result.project_name}")
     print(f"{'='*70}\n")
     
-    print(f"Summary:")
+    print("Summary:")
     print(f"  Total scenes: {result.total_scenes}")
     print(f"  Valid scenes: {result.valid_scenes}")
     print(f"  Errors: {result.error_count}")
     print(f"  Warnings: {result.warning_count}")
     
     if result.comparison:
-        print(f"\nCross-Scene Comparison:")
+        print("\nCross-Scene Comparison:")
         if "confidence_stats" in result.comparison:
             stats = result.comparison["confidence_stats"]
             print(f"  Confidence: min={stats['min']:.3f}, max={stats['max']:.3f}, avg={stats['avg']:.3f}, range={stats['range']:.3f}")
@@ -322,7 +322,7 @@ def print_validation_report(result: DatasetValidationResult, verbose: bool = Fal
         if "total_frames" in result.comparison:
             print(f"  Total frames: {result.comparison['total_frames']:,}")
     
-    print(f"\nPer-Scene Details:")
+    print("\nPer-Scene Details:")
     print(f"{'  Scene':<20} {'Label':<30} {'Frames':<10} {'Confidence':<12} {'Status':<10}")
     print(f"  {'-'*68}")
     

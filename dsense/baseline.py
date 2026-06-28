@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .manifest import project_path
-from .models.features import full_profile, percentile, read_numeric_preview_rows
+from .models.features import feature_manifest, full_profile, percentile, read_numeric_preview_rows, summarize_rows
 from .utils.files import ensure_dir, read_json, write_json
 from .utils.timebase import utc_now_iso
 
@@ -18,6 +18,7 @@ class BaselineModel:
     scene_count: int
     threshold: float
     channels: dict[str, dict[str, float]]
+    feature_manifest: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -26,6 +27,7 @@ class BaselineModel:
             "scene_count": self.scene_count,
             "threshold": self.threshold,
             "channels": self.channels,
+            "feature_manifest": self.feature_manifest,
         }
 
 
@@ -36,6 +38,8 @@ def baseline_path(project_name: str) -> Path:
 def train_project_baseline(project_name: str, threshold: float = 6.0) -> BaselineModel:
     root = project_path(project_name)
     values: dict[str, list[float]] = {}
+    all_features: list[dict[str, float]] = []
+    all_rows: list[dict[str, float]] = []
     scene_count = 0
     for scene_path in sorted((root / "scenes").glob("scene_*/scene.json")):
         try:
@@ -50,6 +54,8 @@ def train_project_baseline(project_name: str, threshold: float = 6.0) -> Baselin
         rows = _read_rows(preview)
         if not rows:
             continue
+        all_features.append(summarize_rows(rows))
+        all_rows.extend(rows)
         scene_count += 1
         for row in rows:
             for channel, value in row.items():
@@ -60,7 +66,7 @@ def train_project_baseline(project_name: str, threshold: float = 6.0) -> Baselin
         for channel, channel_values in values.items()
         if channel_values
     }
-    return BaselineModel(project_name, utc_now_iso(), scene_count, threshold, channels)
+    return BaselineModel(project_name, utc_now_iso(), scene_count, threshold, channels, feature_manifest(all_features, all_rows))
 
 
 def train_and_save_project_baseline(project_name: str, threshold: float = 6.0) -> BaselineModel:
@@ -88,6 +94,7 @@ def load_project_baseline(project_name: str) -> BaselineModel | None:
             str(channel): {str(k): float(v) for k, v in dict(profile).items()}
             for channel, profile in dict(data.get("channels", {})).items()
         },
+        feature_manifest=dict(data.get("feature_manifest", {})),
     )
 
 

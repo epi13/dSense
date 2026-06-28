@@ -5,7 +5,7 @@ from itertools import combinations
 from pathlib import Path
 
 from dsense.manifest import project_path
-from dsense.models.features import feature_distance, mean_profile, summarize_preview
+from dsense.models.features import FEATURE_STATS, feature_distance, mean_profile, summarize_preview
 from dsense.utils.files import ensure_dir, read_json, write_json
 from dsense.utils.timebase import utc_now_iso
 
@@ -23,7 +23,7 @@ def evaluation_report_path(project_name: str) -> Path:
     return project_path(project_name) / "exports" / "evaluation_report.json"
 
 
-def evaluate_project_scenes(project_name: str) -> dict[str, object]:
+def evaluate_project_scenes(project_name: str, out_path: Path | None = None) -> dict[str, object]:
     samples = load_scene_samples(project_name)
     label_counts = _label_counts(samples)
     report = {
@@ -37,8 +37,10 @@ def evaluate_project_scenes(project_name: str) -> dict[str, object]:
         "confusion_matrix": _leave_one_out_confusion(samples),
         "baseline_drift": _baseline_drift(samples),
         "channel_usefulness_ranking": _channel_usefulness(samples),
+        "label_distance_matrix": _label_distance_matrix(samples),
     }
-    out = evaluation_report_path(project_name)
+    report["answers"] = _research_answers(report)
+    out = out_path or evaluation_report_path(project_name)
     ensure_dir(out.parent)
     write_json(out, report)
     return report
@@ -102,6 +104,12 @@ def print_evaluation_report(report: dict[str, object]) -> None:
     top = ", ".join(str(item.get("channel")) for item in list(ranking)[:3]) if isinstance(ranking, list) else "none"
     print(f"{'channel usefulness ranking':<28} {top or 'none':<14} channels that separate labels")
     print("")
+    print("Research answers:")
+    answers = dict(report.get("answers", {}))
+    for key in ("idle_vs_activity", "interaction_separation", "useful_signal", "weak_or_similar_labels"):
+        answer = dict(answers.get(key, {}))
+        print(f"  {key:<24} {answer.get('answer', 'unknown')}: {answer.get('detail', '')}")
+    print("")
     print("Confusion matrix:")
     matrix = dict(report.get("confusion_matrix", {})).get("matrix", {})
     labels = sorted(matrix)
@@ -143,6 +151,19 @@ def _between_label_distance(samples: list[SceneSample]) -> dict[str, object]:
         "average": round(sum(distances) / len(distances), 6) if distances else 0.0,
         "pair_count": len(distances),
     }
+
+
+def _label_distance_matrix(samples: list[SceneSample]) -> dict[str, dict[str, float]]:
+    profiles = {
+        label: mean_profile([sample.features for sample in label_samples])
+        for label, label_samples in _samples_by_label(samples).items()
+    }
+    matrix: dict[str, dict[str, float]] = {label: {} for label in profiles}
+    for left, right in combinations(sorted(profiles), 2):
+        distance, _ = feature_distance(profiles[left], profiles[right])
+        matrix[left][right] = round(distance, 6)
+        matrix[right][left] = round(distance, 6)
+    return matrix
 
 
 def _leave_one_out_confusion(samples: list[SceneSample]) -> dict[str, object]:
@@ -187,34 +208,147 @@ def _baseline_drift(samples: list[SceneSample]) -> dict[str, object]:
 
 
 def _channel_usefulness(samples: list[SceneSample]) -> list[dict[str, object]]:
-    channels = sorted({
-        key.removesuffix("_median")
-        for sample in samples
-        for key in sample.features
-        if key.endswith("_median")
-    })
+    channel_features: dict[str, list[str]] = {}
+    for sample in samples:
+        for key in sample.features:
+            parsed = _split_feature_name(key)
+            if parsed is None:
+                continue
+            channel, _ = parsed
+            channel_features.setdefault(channel, []).append(key)
     by_label = _samples_by_label(samples)
     ranking = []
-    for channel in channels:
-        key = f"{channel}_median"
-        label_means = []
-        within_values = []
-        for label_samples in by_label.values():
-            values = [sample.features.get(key, 0.0) for sample in label_samples]
-            if not values:
-                continue
-            mean = sum(values) / len(values)
-            label_means.append(mean)
-            within_values.extend(abs(value - mean) for value in values)
-        if len(label_means) < 2:
-            score = 0.0
-        else:
-            overall = sum(label_means) / len(label_means)
-            between = sum(abs(value - overall) for value in label_means) / len(label_means)
-            within = (sum(within_values) / len(within_values)) if within_values else 0.0
-            score = between / max(within, 1.0)
-        ranking.append({"channel": channel, "score": round(score, 6)})
+    for channel, features in channel_features.items():
+        scored = [(_feature_usefulness_score(feature, by_label), feature) for feature in sorted(set(features))]
+        score, best_feature = max(scored, key=lambda item: (item[0], item[1])) if scored else (0.0, "")
+        ranking.append({"channel": channel, "score": round(score, 6), "best_feature": best_feature})
     return sorted(ranking, key=lambda item: (-float(item["score"]), str(item["channel"])))
+
+
+def _feature_usefulness_score(feature: str, by_label: dict[str, list[SceneSample]]) -> float:
+    label_means = []
+    within_values = []
+    for label_samples in by_label.values():
+        values = [sample.features.get(feature, 0.0) for sample in label_samples]
+        if not values:
+            continue
+        mean = sum(values) / len(values)
+        label_means.append(mean)
+        within_values.extend(abs(value - mean) for value in values)
+    if len(label_means) < 2:
+        return 0.0
+    overall = sum(label_means) / len(label_means)
+    between = sum(abs(value - overall) for value in label_means) / len(label_means)
+    within = (sum(within_values) / len(within_values)) if within_values else 0.0
+    return between / max(within, 1.0)
+
+
+def _split_feature_name(feature: str) -> tuple[str, str] | None:
+    for stat in sorted(FEATURE_STATS, key=len, reverse=True):
+        suffix = f"_{stat}"
+        if feature.endswith(suffix):
+            return feature[:-len(suffix)], stat
+    return None
+
+
+def _research_answers(report: dict[str, object]) -> dict[str, object]:
+    label_counts = {str(k): int(v) for k, v in dict(report.get("label_counts", {})).items()}
+    confusion = dict(report.get("confusion_matrix", {}))
+    matrix = {
+        str(actual): {str(predicted): int(count) for predicted, count in dict(predictions).items()}
+        for actual, predictions in dict(confusion.get("matrix", {})).items()
+    }
+    ranking = list(report.get("channel_usefulness_ranking", []))
+    weak_labels, similar_pairs = _weak_and_similar_labels(report)
+    return {
+        "idle_vs_activity": _idle_vs_activity_answer(label_counts, matrix),
+        "interaction_separation": _interaction_separation_answer(label_counts, matrix),
+        "useful_signal": _useful_signal_answer(ranking),
+        "weak_or_similar_labels": _weak_labels_answer(weak_labels, similar_pairs),
+    }
+
+
+def _idle_vs_activity_answer(label_counts: dict[str, int], matrix: dict[str, dict[str, int]]) -> dict[str, object]:
+    baseline_labels = {label for label in label_counts if label.startswith("baseline_")}
+    activity_labels = set(label_counts) - baseline_labels
+    if not baseline_labels or not activity_labels:
+        return {"answer": "unknown", "detail": "needs at least one baseline label and one activity label"}
+    correct = 0
+    total = 0
+    for actual, predictions in matrix.items():
+        actual_is_baseline = actual in baseline_labels
+        for predicted, count in predictions.items():
+            predicted_is_baseline = predicted in baseline_labels
+            total += count
+            if actual_is_baseline == predicted_is_baseline:
+                correct += count
+    accuracy = correct / total if total else 0.0
+    answer = "yes" if accuracy >= 0.8 else "no"
+    return {"answer": answer, "accuracy": round(accuracy, 6), "detail": f"baseline-vs-activity accuracy {accuracy:.1%}"}
+
+
+def _interaction_separation_answer(label_counts: dict[str, int], matrix: dict[str, dict[str, int]]) -> dict[str, object]:
+    activity_labels = {label for label in label_counts if not label.startswith("baseline_")}
+    if len(activity_labels) < 2:
+        return {"answer": "unknown", "detail": "needs at least two non-baseline labels"}
+    under_sampled = sorted(label for label in activity_labels if label_counts[label] < 2)
+    correct = 0
+    total = 0
+    for actual in activity_labels:
+        for predicted, count in matrix.get(actual, {}).items():
+            total += count
+            if predicted == actual:
+                correct += count
+    accuracy = correct / total if total else 0.0
+    if under_sampled:
+        return {"answer": "unknown", "accuracy": round(accuracy, 6), "detail": f"needs repeated takes for: {', '.join(under_sampled)}"}
+    answer = "yes" if accuracy >= 0.8 else "no"
+    return {"answer": answer, "accuracy": round(accuracy, 6), "detail": f"interaction-label accuracy {accuracy:.1%}"}
+
+
+def _useful_signal_answer(ranking: list[object]) -> dict[str, object]:
+    if not ranking:
+        return {"answer": "unknown", "detail": "no numeric preview channels found"}
+    top = dict(ranking[0])
+    channel = str(top.get("channel", "unknown"))
+    score = float(top.get("score", 0.0))
+    answer = "yes" if score > 0 else "unknown"
+    return {"answer": answer, "channel": channel, "score": round(score, 6), "detail": f"top channel {channel} scored {score:.3f}"}
+
+
+def _weak_labels_answer(weak_labels: list[str], similar_pairs: list[dict[str, object]]) -> dict[str, object]:
+    if not weak_labels and not similar_pairs:
+        return {"answer": "none_detected", "detail": "no low-repeatability or too-similar labels detected"}
+    details = []
+    if weak_labels:
+        details.append(f"weak labels: {', '.join(weak_labels)}")
+    if similar_pairs:
+        pairs = ", ".join(f"{pair['left']}~{pair['right']}" for pair in similar_pairs[:3])
+        details.append(f"too similar: {pairs}")
+    return {"answer": "review", "weak_labels": weak_labels, "similar_pairs": similar_pairs, "detail": "; ".join(details)}
+
+
+def _weak_and_similar_labels(report: dict[str, object]) -> tuple[list[str], list[dict[str, object]]]:
+    label_counts = {str(k): int(v) for k, v in dict(report.get("label_counts", {})).items()}
+    within = dict(dict(report.get("within_label_similarity", {})).get("labels", {}))
+    weak = sorted(
+        label
+        for label, count in label_counts.items()
+        if count < 2 or float(within.get(label, 1.0)) < 0.7
+    )
+    between_average = float(dict(report.get("between_label_distance", {})).get("average", 0.0))
+    threshold = max(0.1, between_average * 0.5)
+    matrix = {
+        str(left): {str(right): float(distance) for right, distance in dict(row).items()}
+        for left, row in dict(report.get("label_distance_matrix", {})).items()
+    }
+    similar = []
+    for left, row in matrix.items():
+        for right, distance in row.items():
+            if left < right and distance <= threshold:
+                similar.append({"left": left, "right": right, "distance": round(distance, 6)})
+    similar.sort(key=lambda item: (float(item["distance"]), str(item["left"]), str(item["right"])))
+    return weak, similar
 
 
 def _samples_by_label(samples: list[SceneSample]) -> dict[str, list[SceneSample]]:

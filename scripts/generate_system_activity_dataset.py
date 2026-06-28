@@ -19,7 +19,6 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from pathlib import Path
 
 from dsense.manifest import init_project, allocate_scene_id, project_path
 from dsense.recorder import record_scene
@@ -74,7 +73,7 @@ def record_activity_dataset(project_name: str, tick_hz: int = 100, filter_str: s
         return {}
     
     print(f"\n{'='*80}")
-    print(f"dSense System Activity Dataset Generator")
+    print("dSense System Activity Dataset Generator")
     print(f"{'='*80}")
     print(f"Project: {project_name}")
     print(f"Scenarios to record: {len(scenarios)}")
