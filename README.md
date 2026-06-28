@@ -68,6 +68,7 @@ python -m dsense init demo_lab
 python -m dsense scan
 python -m dsense scan --advanced
 python -m dsense record-baseline demo_lab --duration 30
+python -m dsense baseline-suite base --target-scenes 200 --yes
 python -m dsense auto-scenes base --group baseline --repeat 3 --yes
 python -m dsense auto-scenes base --group activity --repeat 2 --yes
 python -m dsense tui --label person_walks_front_left_to_right --duration 10 --pre-roll 2 --action 5 --post-roll 3 --repeat 3
@@ -85,7 +86,7 @@ python -m dsense export-preview demo_lab
 
 If installed with the console script, replace `python -m dsense` with `dsense`.
 
-The default tick rate is 100 Hz. Higher rates are allowed with `--tick-hz`, but 1000 Hz can be unrealistic in Python depending on the OS, scheduler, and machine state.
+The default tick rate is 100 Hz. Higher rates are allowed with `--tick-hz`, but 1000 Hz can be unrealistic in Python depending on the OS, scheduler, and machine state. The recorder respects each channel's declared `rate_hz`: lower-rate channels are sampled only when due and their last value is reused between samples, with sampled/stale/unavailable masks written to `preview.csv`.
 
 For non-interactive captures, `dsense scene` also provides `--yes` to keep captures without prompting.
 
@@ -107,6 +108,11 @@ python -m dsense scene base --label user_walk_left_to_right --duration 10 --pre-
 Baseline and activity presets can be captured without user interaction:
 
 ```bash
+python -m dsense baseline-suite base --target-scenes 200 --yes
+python -m dsense baseline-suite base --target-scenes 100 --repeat 2 --yes
+python -m dsense baseline-suite base --target-scenes 200 --seed 42 --yes
+python -m dsense baseline-suite base --target-scenes 200 --categories idle,cpu,disk,proc --yes
+python -m dsense baseline-suite base --target-scenes 200 --dry-run
 python -m dsense auto-scenes base --group baseline --yes
 python -m dsense auto-scenes base --group activity --yes
 python -m dsense auto-scenes base --group baseline --repeat 3 --tick-hz 100 --yes
@@ -116,25 +122,41 @@ python -m dsense auto-scenes base --exclude activity_disk_write_tempfile --yes
 
 Activity workloads run only during the configured action window. They are pure Python standard-library helpers, use local temporary files when disk activity is needed, clean up afterward, and do not use microphone, camera, RF, network, or external AI calls. Treat these scenes as controlled machine-internal labels, not proof of external sensing.
 
+### Baseline suite
+
+`baseline-suite` is the recommended way to build a deeper negative-control dataset on Linux. It generates a deterministic plan from a structured catalog of safe automatic controls: quiet idle, timing/scheduler observation, modest CPU loops, memory allocation/release, temp-file metadata/read/write controls, Linux `/proc` and sysfs reads when available, mixed tiny workloads, and longitudinal drift repeats. These scenes are labeled as `baseline_...` controls and marked as no intentional physical interaction.
+
+By default, network controls are disabled. They are included only with `--include-network` and only when `DSENSE_NET_HOST` is explicitly configured. Heavier workloads are disabled unless `--include-heavy` is passed. The suite writes normal scene artifacts plus `datasets/<project>/exports/baseline_suite_report.json`, including category counts, scenario order, seed, channel groups, failures/skips, validation summary, baseline/classifier summaries, drift, and noisy-channel summary.
+
+Dry-run planning shows the suite without recording:
+
+```bash
+python -m dsense baseline-suite base --target-scenes 200 --dry-run
+```
+
+More baseline/control scenes reduce false positives from ordinary machine variation, but they do not prove physical sensing or reliable human detection.
+
 Recommended first dataset sequence:
 
 ```bash
 python -m dsense init base
-python -m dsense auto-scenes base --group baseline --repeat 3 --yes
-python -m dsense auto-scenes base --group activity --repeat 2 --yes
-python -m dsense tui base
+python -m dsense baseline-suite base --target-scenes 200 --yes
 python -m dsense train-baseline base
 python -m dsense train-classifier base
 python -m dsense validate base --verbose
+python -m dsense evaluate-scenes base
+python -m dsense tui base
 ```
 
 `dsense doctor` checks Python version, dataset folder state, terminal/TUI support, write permissions, and channel availability. Use `python -m dsense validate base --verbose` before training or pass `--require-valid` to training/export commands so broken captures fail clearly.
 
-Channel groups keep dSense portable by default. `portable` is the default group. `linux` adds optional `/proc` and thermal/sysfs adapters when readable. `experimental` currently reports the eBPF adapter as unavailable unless a future implementation is installed. Use `dsense scan --advanced` to see group and permission status, and `dsense scene base --channels portable,linux ...` to opt into Linux telemetry for a capture.
+Channel groups keep dSense portable by default. `portable` is the default group. `linux` adds optional `/proc` and thermal/sysfs adapters when readable. `experimental` currently reports the eBPF adapter as unavailable unless a future implementation is installed. Use `dsense scan --advanced` to see group and permission status, and `dsense scene base --channels portable,linux ...` to opt into Linux telemetry for a capture. The optional network latency channel is disabled unless `DSENSE_NET_HOST` is set; it performs TCP connect timing and can perturb measurements, so use it deliberately.
 
 ## TUI interaction recorder
 
 Use `python -m dsense` or `python -m dsense tui` for the full-screen recorder. By default it opens the base project at `datasets/base/`, loads all existing scenes from that project, and stores new captures there. To use another project, pass it explicitly, for example `python -m dsense tui demo_lab`.
+
+The TUI is Linux/Unix-first because it depends on terminal curses behavior. Non-TUI commands such as `doctor`, `scan`, `init`, `record-baseline`, `scene`, `validate`, and export commands are intended to remain portable where the underlying channel adapters are available.
 
 When the TUI opens on Linux/Fedora, dSense records a short local startup baseline scene labeled `baseline_startup_auto`, trains `exports/baseline_model.json`, and then opens the interface. This means the scene count should increase by one each time the TUI starts unless startup baseline capture is disabled. On non-Linux systems the default policy is `missing-only`, so dSense records this startup baseline only when no usable baseline model exists. dSense tries portable plus readable Linux channels for startup baselines; unavailable channels are skipped without privileged requirements.
 
@@ -289,7 +311,7 @@ datasets/<project_name>/
     events.jsonl
 ```
 
-`scene.json` stores label, time windows, channel metadata, quality summary, acceptance state, and notes. `frames.ds64` contains only 64-byte frames. `events.jsonl` stores scene start, action start, action end, scene end, manual markers, and heuristic events. `preview.csv` exposes inspectable columns: `tick`, `t_ns`, `dt_ns`, `sleep_drift_ns`, `process_ns_estimate`, `quality_flags`, plus optional extra channel columns such as `cpu_load_ppm`, `disk_stat_latency_ns`, `network_latency_ns`, `power_online`, and `battery_percent`. `checksum.txt` stores a SHA-256 checksum of the frame file.
+`scene.json` stores label, time windows, channel metadata, quality summary, acceptance state, and notes. `frames.ds64` contains only 64-byte frames. RAW int32 frame fields are clamped on overflow and marked through the quality mask rather than crashing a recording. `events.jsonl` stores scene start, action start, action end, scene end, manual markers, and heuristic events. `preview.csv` exposes inspectable columns: `tick`, `t_ns`, `dt_ns`, `sleep_drift_ns`, `process_ns_estimate`, `quality_flags`, channel scheduling masks, plus optional extra channel columns such as `cpu_load_ppm`, `disk_stat_latency_ns`, `network_latency_ns`, `power_online`, and `battery_percent`. `checksum.txt` stores a SHA-256 checksum of the frame file.
 
 ## Frame format summary
 

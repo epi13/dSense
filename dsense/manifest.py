@@ -52,7 +52,7 @@ def scan_channels(advanced: bool = False, groups: list[str] | tuple[str, ...] | 
     for ch in default_channels(selected_groups):
         try:
             available = ch.available()
-            reason = "ok" if available else "unavailable"
+            reason = "ok" if available else str(getattr(ch, "reason", "") or "unavailable")
         except Exception as exc:
             available, reason = False, str(exc)
         if ch.id == "experimental_ebpf" and not available:

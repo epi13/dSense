@@ -15,10 +15,18 @@ class NetworkLatencyChannel:
 
     def __init__(self) -> None:
         self.host = os.environ.get("DSENSE_NET_HOST", "")
-        self.port = int(os.environ.get("DSENSE_NET_PORT", "443"))
+        self.port = 443
+        self.reason = ""
+        raw_port = os.environ.get("DSENSE_NET_PORT", "443")
+        try:
+            self.port = int(raw_port)
+            if not (1 <= self.port <= 65535):
+                self.reason = f"invalid DSENSE_NET_PORT: {raw_port}"
+        except ValueError:
+            self.reason = f"invalid DSENSE_NET_PORT: {raw_port}"
 
     def available(self) -> bool:
-        return bool(self.host)
+        return bool(self.host) and not self.reason
 
     def start(self) -> None:
         pass

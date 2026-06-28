@@ -31,6 +31,19 @@ def test_doctor_reports_fresh_environment(tmp_path, monkeypatch, capsys):
     assert doctor_ok(run_doctor("base"))
 
 
+def test_cli_smoke_init_scan_record_validate(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+
+    main(["init", "smoke"])
+    main(["scan"])
+    main(["record-baseline", "smoke", "--duration", "0.05", "--tick-hz", "10"])
+    main(["validate", "smoke", "--verbose"])
+
+    out = capsys.readouterr().out
+    assert "Recorded scene_000001" in out
+    assert "dSense Dataset Validation Report: smoke" in out
+
+
 def test_validate_missing_project_has_clear_message(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
@@ -39,6 +52,15 @@ def test_validate_missing_project_has_clear_message(tmp_path, monkeypatch):
 
     assert "Not found:" in str(exc.value)
     assert "No scenes directory" in str(exc.value)
+
+
+def test_scene_duration_conflict_has_clear_error(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(SystemExit) as exc:
+        main(["scene", "base", "--label", "x", "--duration", "1", "--pre-roll", "1", "--action", "1", "--post-roll", "1", "--yes"])
+
+    assert "duration must equal pre_roll + action + post_roll" in str(exc.value)
 
 
 def test_require_valid_bad_dataset_message(sample_dataset, capsys):

@@ -8,6 +8,8 @@ MAGIC = b"DS01"
 FRAME_SIZE = 64
 HEADER = struct.Struct("<4sIQII")
 RAW = struct.Struct("<iiiI")  # dt_ns, sleep_drift_ns, process_ns_estimate, reserved
+INT32_MIN = -(2**31)
+INT32_MAX = 2**31 - 1
 
 
 @dataclass(frozen=True)
@@ -29,10 +31,15 @@ def _digest(data: bytes, size: int = 8) -> bytes:
     return hashlib.blake2s(data, digest_size=size).digest()
 
 
+def clamp_int32(value: int | float | bool) -> int:
+    number = int(value)
+    return max(INT32_MIN, min(INT32_MAX, number))
+
+
 def build_frame(sequence: int, t_ns: int, availability_mask: int, quality_mask: int,
                 dt_ns: int = 0, sleep_drift_ns: int = 0, process_ns_estimate: int = 0,
                 raw_reserved: int = 0) -> bytes:
-    raw = RAW.pack(int(dt_ns), int(sleep_drift_ns), int(process_ns_estimate), int(raw_reserved))
+    raw = RAW.pack(clamp_int32(dt_ns), clamp_int32(sleep_drift_ns), clamp_int32(process_ns_estimate), int(raw_reserved) & 0xFFFFFFFF)
     header = HEADER.pack(MAGIC, sequence & 0xFFFFFFFF, t_ns & 0xFFFFFFFFFFFFFFFF,
                          availability_mask & 0xFFFFFFFF, quality_mask & 0xFFFFFFFF)
     mix = _digest(header + raw, 16)

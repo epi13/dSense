@@ -29,3 +29,7 @@ Channel bit assignments in v0:
 The MIX lane is not cryptographic entropy. It is a deterministic digest-based representation intended to reduce obvious bias for downstream experiments while preserving honest documentation of its limits.
 
 Only the original RAW fields are packed into the fixed 64-byte frame. Additional v1 channel values are stored in `preview.csv` and scene metadata so older frame readers remain compatible.
+
+RAW int32 fields are saturated to the signed int32 range before packing. This prevents suspend/resume pauses, debugger stops, scheduler hiccups, or unusual tick settings from crashing frame writing. When the recorder sees an out-of-range RAW value it sets the high quality/degradation bit in the frame quality mask; older readers can still parse the clamped values.
+
+Recorder channel scheduling respects each channel's declared `rate_hz`. The main recorder tick still runs at the scene `tick_hz`, but lower-rate channels are sampled only when due. Preview CSV rows include `channel_sampled_mask`, `channel_stale_mask`, and `channel_unavailable_mask` so reused stale values and unavailable channels remain inspectable without changing the fixed frame format.

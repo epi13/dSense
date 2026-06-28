@@ -10,19 +10,20 @@ from pathlib import Path
 
 from .baseline import load_project_baseline, score_against_baseline, train_and_save_project_baseline
 from .channels import default_channels
-from .channels.sleep_jitter import SleepJitterChannel
 from .classifier import load_project_classifier, predict_scene, train_and_save_project_classifier
 from .event_detector import HeuristicEventDetector
 from .frame import FRAME_SIZE, build_frame
+from .inputs import validate_capture_params
 from .manifest import allocate_scene_id, project_path
 from .orbiters import append_orbiter_summary, make_orbiter_summary
 from .quality import summarize_frames
-from .recorder import record_scene
+from .recorder import RAW_OVERFLOW_QUALITY_MASK, _prepare_channel_runtimes, _raw_overflowed, _sample_runtimes, _stop_channel_runtimes, record_scene
 from .utils.files import ensure_dir, read_json, write_json
 from .utils.timebase import monotonic_ns, utc_now_iso
 
 
 def run_watcher_scan(project_name: str, duration: float = 5.0, tick_hz: int = 50) -> dict[str, object]:
+    validate_capture_params(duration, tick_hz)
     root = project_path(project_name)
     baseline = load_project_baseline(project_name) or train_and_save_project_baseline(project_name)
     classifier = load_project_classifier(project_name) or train_and_save_project_classifier(project_name)
@@ -103,6 +104,9 @@ def run_rolling_watcher(
     sample_rows: Iterable[dict[str, object]] | None = None,
     prompt_label: bool = False,
 ) -> dict[str, object]:
+    validate_capture_params(max(duration, 0.01) if duration else 0.01, tick_hz)
+    if pre_seconds < 0 or post_seconds < 0 or cooldown_seconds < 0:
+        raise ValueError("pre_seconds, post_seconds, and cooldown_seconds must be >= 0")
     root = project_path(project_name)
     baseline = load_project_baseline(project_name) or train_and_save_project_baseline(project_name)
     classifier = load_project_classifier(project_name) or train_and_save_project_classifier(project_name)
@@ -247,9 +251,7 @@ def read_recent_watcher_events(project_name: str, limit: int = 5) -> list[dict[s
 
 
 def _live_samples(tick_hz: int, interval_ns: int) -> Iterable[dict[str, object]]:
-    channels = default_channels()
-    for channel in channels:
-        channel.start()
+    channels = _prepare_channel_runtimes(default_channels(), tick_hz)
     start_ns = monotonic_ns()
     tick = 0
     try:
@@ -259,28 +261,20 @@ def _live_samples(tick_hz: int, interval_ns: int) -> Iterable[dict[str, object]]
             if sleep_s > 0:
                 time.sleep(sleep_s)
             now = monotonic_ns()
-            availability = 0
-            quality = 0
-            values: dict[str, object] = {}
-            for channel in channels:
-                if isinstance(channel, SleepJitterChannel):
-                    channel.set_target(target_ns)
-                if channel.available():
-                    availability |= 1 << channel.bit
-                    sample = channel.sample(tick, now)
-                    quality |= (sample.quality_flag & 1) << channel.bit
-                    values.update({key: int(value) for key, value in sample.values.items() if isinstance(value, (int, float, bool))})
+            values, availability, quality, sampled_mask, stale_mask, unavailable_mask = _sample_runtimes(channels, tick, now, target_ns)
             yield {
                 "tick": tick,
                 "t_ns": now,
                 "availability_mask": availability,
                 "quality_flags": quality,
+                "channel_sampled_mask": sampled_mask,
+                "channel_stale_mask": stale_mask,
+                "channel_unavailable_mask": unavailable_mask,
                 **values,
             }
             tick += 1
     finally:
-        for channel in channels:
-            channel.stop()
+        _stop_channel_runtimes(channels)
 
 
 def _normalize_sample(sample: dict[str, object], tick: int, interval_ns: int) -> dict[str, object]:
@@ -325,14 +319,22 @@ def _write_rolling_scene(
     frames_path = scene_dir / "frames.ds64"
     with frames_path.open("wb") as handle:
         for idx, sample in enumerate(samples):
+            raw_values = {
+                "dt_ns": int(float(sample.get("dt_ns", 0) or 0)),
+                "sleep_drift_ns": int(float(sample.get("sleep_drift_ns", 0) or 0)),
+                "process_ns_estimate": int(float(sample.get("process_ns_estimate", 0) or 0)),
+            }
+            quality_flags = int(sample.get("quality_flags", 0) or 0)
+            if _raw_overflowed(raw_values):
+                quality_flags |= RAW_OVERFLOW_QUALITY_MASK
             handle.write(build_frame(
                 idx,
                 int(sample.get("t_ns", idx * interval_ns) or 0),
                 int(sample.get("availability_mask", 0) or 0),
-                int(sample.get("quality_flags", 0) or 0),
-                int(float(sample.get("dt_ns", 0) or 0)),
-                int(float(sample.get("sleep_drift_ns", 0) or 0)),
-                int(float(sample.get("process_ns_estimate", 0) or 0)),
+                quality_flags,
+                raw_values["dt_ns"],
+                raw_values["sleep_drift_ns"],
+                raw_values["process_ns_estimate"],
             ))
     _write_preview(scene_dir / "preview.csv", samples)
     shifted_events = [

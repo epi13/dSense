@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import argparse, csv, json, sys
-import curses
 from pathlib import Path
 from .baseline import default_auto_baseline_policy, ensure_startup_baseline, train_and_save_project_baseline
+from .baseline_suite import baseline_suite_report_path, run_baseline_suite
 from .channels import parse_channel_groups
 from .classifier import train_and_save_project_classifier
 from .doctor import doctor_ok, print_doctor_report, run_doctor
 from .gemma_edge import gemma_edge_status
+from .inputs import validate_capture_params, validate_duration_windows
 from .manifest import DEFAULT_PROJECT, init_project, scan_channels, project_path, allocate_scene_id
 from .models.evaluation import evaluate_project_scenes, evaluation_report_path, print_evaluation_report
 from .models.feature_export import extract_project_features, features_path, rank_project_channels
@@ -23,7 +24,6 @@ from .replay import (
 )
 from .recorder import record_scene
 from .scenarios import SCENARIO_GROUPS, Scenario, all_scenarios
-from .tui import CaptureConfig, run_tui
 from .trace import export_trace, trace_path, viewer_path, write_scene_viewer
 from .wizard import guided_scene
 from .workloads import valid_workload_ids, workload_progress_callback
@@ -45,6 +45,7 @@ def cmd_scan(args):
 
 
 def cmd_record_baseline(args):
+    validate_capture_params(args.duration, args.tick_hz)
     init_project(args.project_name)
     scene_id = allocate_scene_id(args.project_name)
     groups = parse_channel_groups(args.channels)
@@ -53,6 +54,7 @@ def cmd_record_baseline(args):
 
 
 def cmd_auto_scenes(args):
+    _validate_repeat_tick(args.repeat, args.tick_hz)
     init_project(args.project_name)
     selected = _select_auto_scenarios(args.group, args.include, args.exclude)
     if not selected:
@@ -107,6 +109,43 @@ def cmd_auto_scenes(args):
     print(f"Validation: {result.valid_scenes}/{result.total_scenes} valid, errors={result.error_count}, warnings={result.warning_count}")
 
 
+def cmd_baseline_suite(args):
+    _validate_repeat_tick(args.repeat, args.tick_hz)
+    categories = _split_csv(args.categories)
+    exclude_categories = _split_csv(args.exclude_categories)
+    report = run_baseline_suite(
+        args.project_name or DEFAULT_PROJECT,
+        target_scenes=args.target_scenes * args.repeat,
+        categories=categories or None,
+        exclude_categories=exclude_categories or None,
+        seed=args.seed,
+        duration=args.duration,
+        tick_hz=args.tick_hz,
+        linux=args.linux,
+        dry_run=args.dry_run,
+        assume_yes=args.yes,
+        include_network=args.include_network,
+        include_heavy=args.include_heavy,
+    )
+    if args.dry_run:
+        plan = dict(report["plan"])
+        print(f"Baseline suite dry-run: {args.project_name}")
+        print(f"planned scenes: {plan['planned_scene_count']} target={plan['target_scenes']}")
+        print(f"categories: {', '.join(plan['categories'])}")
+        print(f"estimated duration: {plan['estimated_duration_seconds']}s")
+        print(f"network: {'enabled' if report.get('network_enabled') else 'disabled'}")
+        print(f"linux channels: {'enabled' if args.linux else 'disabled'}")
+        for item in list(plan["scenarios"])[: min(20, len(plan["scenarios"]))]:
+            print(f"{item['order']:>4} {item['category']:<10} {item['label']} workload={item.get('workload') or 'none'}")
+        if int(plan["planned_scene_count"]) > 20:
+            print(f"... {int(plan['planned_scene_count']) - 20} more")
+        return
+    print(f"Baseline suite complete: recorded={report['actual_scene_count']} target={report['target_scene_count']}")
+    summary = dict(report.get("validation_summary", {}))
+    print(f"Validation: {summary.get('valid_scenes')}/{summary.get('total_scenes')} valid errors={summary.get('errors')} warnings={summary.get('warnings')}")
+    print(baseline_suite_report_path(args.project_name or DEFAULT_PROJECT))
+
+
 def _select_auto_scenarios(group: str, include: str, exclude: str) -> list[Scenario]:
     labels = {scenario.label: scenario for scenario in all_scenarios()}
     include_labels = _split_csv(include)
@@ -148,12 +187,34 @@ def _print_auto_scene_training_hint(project_name: str) -> None:
     print(f"Trained classifier: {classifier_model.scene_count} scenes")
 
 
+def _validated_duration(duration: float | None, pre_roll: float, action: float, post_roll: float) -> float:
+    return validate_duration_windows(duration, pre_roll, action, post_roll)
+
+
+def _validate_repeat_tick(repeat: int, tick_hz: int) -> None:
+    validate_capture_params(duration=1.0, tick_hz=tick_hz, repeat=repeat)
+
+
+def _run_tui_config(**kwargs) -> list[dict[str, object]]:
+    try:
+        from .tui import CaptureConfig, run_tui
+    except Exception as exc:
+        raise SystemExit(f"TUI unavailable: {exc}. Non-TUI commands like doctor, scan, init, scene, and validate are still available.") from None
+    try:
+        return run_tui(CaptureConfig(**kwargs))
+    except Exception as exc:
+        if "curses" in exc.__class__.__module__ or exc.__class__.__name__ == "error":
+            raise SystemExit(f"TUI failed: {exc}. Try 'dsense doctor' to check terminal support, or use non-TUI commands.") from None
+        raise
+
+
 def cmd_scene(args):
     init_project(args.project_name)
-    duration = args.duration or (args.pre_roll + args.action + args.post_roll)
+    duration = _validated_duration(args.duration, args.pre_roll, args.action, args.post_roll)
+    _validate_repeat_tick(args.repeat, args.tick_hz)
     groups = parse_channel_groups(args.channels)
     if args.tui:
-        run_tui(CaptureConfig(
+        _run_tui_config(
             project_name=args.project_name,
             label=args.label,
             duration=duration,
@@ -163,7 +224,7 @@ def cmd_scene(args):
             repeat=args.repeat,
             tick_hz=args.tick_hz,
             notes=args.notes,
-        ))
+        )
         return
     guided_scene(args.project_name, args.label, duration, args.pre_roll, args.action, args.post_roll, args.repeat, args.notes, args.tick_hz, args.yes, channel_groups=groups)
 
@@ -190,8 +251,9 @@ def cmd_tui(args):
     elif status.get("status") == "failed":
         print("Continuing without startup baseline.")
     print("Opening TUI...")
-    duration = args.duration or (args.pre_roll + args.action + args.post_roll)
-    run_tui(CaptureConfig(
+    duration = _validated_duration(args.duration, args.pre_roll, args.action, args.post_roll)
+    _validate_repeat_tick(args.repeat, args.tick_hz)
+    _run_tui_config(
         project_name=project_name,
         label=args.label,
         duration=duration,
@@ -202,7 +264,7 @@ def cmd_tui(args):
         tick_hz=args.tick_hz,
         notes=args.notes,
         startup_baseline_status=startup_baseline_status,
-    ))
+    )
 
 
 def cmd_list(args):
@@ -404,6 +466,7 @@ def cmd_gemma_status(args):
 def cmd_watcher(args):
     project_name = args.project_name or DEFAULT_PROJECT
     init_project(project_name)
+    validate_capture_params(max(args.duration, 0.01) if args.duration else 0.01, args.tick_hz)
     if args.rolling:
         result = run_rolling_watcher(
             project_name,
@@ -484,6 +547,21 @@ def build_parser():
     sp.add_argument("--notes", default="", help="override scenario notes for this batch")
     sp.add_argument("--yes", action="store_true", help="start and accept captures without prompts")
     sp.set_defaults(func=cmd_auto_scenes)
+    sp = sub.add_parser("baseline-suite")
+    sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to record into (default: {DEFAULT_PROJECT})")
+    sp.add_argument("--linux", action=argparse.BooleanOptionalAction, default=True, help="include Linux channel group and Linux-safe proc/sysfs controls")
+    sp.add_argument("--target-scenes", type=int, default=200)
+    sp.add_argument("--repeat", type=int, default=1, help="multiply the target scene plan by this repeat count")
+    sp.add_argument("--categories", default="", help="comma-separated categories to include")
+    sp.add_argument("--exclude-categories", default="", help="comma-separated categories to exclude")
+    sp.add_argument("--seed", type=int)
+    sp.add_argument("--duration", type=float, default=1.0, help="seconds per planned scene")
+    sp.add_argument("--tick-hz", type=int, default=50)
+    sp.add_argument("--dry-run", action="store_true")
+    sp.add_argument("--yes", action="store_true", help="run unattended")
+    sp.add_argument("--include-network", action="store_true", help="include network controls only when DSENSE_NET_HOST is configured")
+    sp.add_argument("--include-heavy", action="store_true", help="include heavier opt-in workloads")
+    sp.set_defaults(func=cmd_baseline_suite)
     sp = sub.add_parser("scene"); sp.add_argument("project_name"); sp.add_argument("--label", required=True); sp.add_argument("--duration", type=float); sp.add_argument("--pre-roll", type=float, default=2); sp.add_argument("--action", type=float, default=5); sp.add_argument("--post-roll", type=float, default=3); sp.add_argument("--repeat", type=int, default=1); sp.add_argument("--notes", default=""); sp.add_argument("--tick-hz", type=int, default=100); sp.add_argument("--channels", default="portable", help="channel groups, e.g. portable or portable,linux"); sp.add_argument("--yes", action="store_true", help="accept captures without prompt"); sp.add_argument("--tui", action="store_true", help="record with the full-screen interaction recorder"); sp.set_defaults(func=cmd_scene)
     sp = sub.add_parser("tui"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to open (default: {DEFAULT_PROJECT})"); sp.add_argument("--label", default="user_interaction"); sp.add_argument("--duration", type=float); sp.add_argument("--pre-roll", type=float, default=2); sp.add_argument("--action", type=float, default=5); sp.add_argument("--post-roll", type=float, default=3); sp.add_argument("--repeat", type=int, default=1); sp.add_argument("--notes", default=""); sp.add_argument("--tick-hz", type=int, default=100); sp.add_argument("--auto-baseline-policy", choices=["auto", "startup", "missing-only", "off"], default="auto", help="startup baseline policy; auto uses startup on Linux and missing-only elsewhere"); sp.add_argument("--no-auto-baseline", action="store_true", help="same as --auto-baseline-policy off"); sp.add_argument("--auto-baseline-duration", type=float, default=5.0, help="seconds for automatic startup baseline capture"); sp.add_argument("--force-auto-baseline", action="store_true", help="record a fresh startup baseline unless policy is off"); sp.set_defaults(func=cmd_tui)
     sp = sub.add_parser("list-scenes"); sp.add_argument("project_name"); sp.set_defaults(func=cmd_list)
@@ -528,8 +606,6 @@ def main(argv=None):
         raise SystemExit(f"Invalid JSON: {exc}") from None
     except csv.Error as exc:
         raise SystemExit(f"Invalid CSV: {exc}") from None
-    except curses.error as exc:
-        raise SystemExit(f"TUI failed: {exc}. Try 'dsense doctor' to check terminal support.") from None
     except OSError as exc:
         raise SystemExit(f"I/O error: {exc}") from None
     except ValueError as exc:

@@ -66,6 +66,19 @@ def disk_write_tempfile(stop_event: threading.Event) -> None:
             stop_event.wait(0.01)
 
 
+def disk_read_tempfile(stop_event: threading.Event) -> None:
+    block = b"dsense-read-workload\n" * 128
+    with tempfile.TemporaryDirectory(prefix="dsense-read-") as tmp:
+        path = Path(tmp) / "read.tmp"
+        path.write_bytes(block * 16)
+        while not stop_event.is_set():
+            try:
+                path.read_bytes()
+            except OSError:
+                pass
+            stop_event.wait(0.01)
+
+
 def memory_allocate_release(stop_event: threading.Event) -> None:
     while not stop_event.is_set():
         chunks = [bytearray(256 * 1024) for _ in range(8)]
@@ -94,6 +107,45 @@ def mixed_cpu_disk(stop_event: threading.Event) -> None:
         disk_thread.join(timeout=1.0)
 
 
+def proc_read(stop_event: threading.Event) -> None:
+    paths = [Path("/proc/stat"), Path("/proc/self/status"), Path("/proc/meminfo")]
+    readable = [path for path in paths if path.exists()]
+    while not stop_event.is_set():
+        for path in readable:
+            try:
+                path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                pass
+        stop_event.wait(0.02)
+
+
+def sysfs_read(stop_event: threading.Event) -> None:
+    roots = [Path("/sys/class/thermal"), Path("/sys/class/power_supply")]
+    paths: list[Path] = []
+    for root in roots:
+        if root.exists():
+            paths.extend(path for path in root.glob("*/*") if path.is_file())
+    paths = paths[:16]
+    while not stop_event.is_set():
+        for path in paths:
+            try:
+                path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                pass
+        stop_event.wait(0.05)
+
+
+def memory_cpu(stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        chunks = [bytearray(128 * 1024) for _ in range(4)]
+        total = 0
+        for n in range(5_000):
+            total = (total + n * n) % 1_000_003
+        del chunks
+        _ = total
+        stop_event.wait(0.02)
+
+
 def noop(stop_event: threading.Event) -> None:
     while not stop_event.is_set():
         stop_event.wait(0.05)
@@ -104,9 +156,13 @@ WORKLOADS: dict[str, WorkloadFunc] = {
     "cpu_heavy": cpu_heavy,
     "disk_stat_burst": disk_stat_burst,
     "disk_write_tempfile": disk_write_tempfile,
+    "disk_read_tempfile": disk_read_tempfile,
     "memory_allocate_release": memory_allocate_release,
     "python_loop": python_loop,
     "mixed_cpu_disk": mixed_cpu_disk,
+    "proc_read": proc_read,
+    "sysfs_read": sysfs_read,
+    "memory_cpu": memory_cpu,
     "noop": noop,
 }
 
