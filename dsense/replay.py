@@ -92,6 +92,13 @@ def replay_scene(project_name: str, scene_dir: Path, limit: int = 10) -> dict[st
             "sleep_drift_ns": _float_value(row.get("sleep_drift_ns"), 0.0),
             "process_ns_estimate": _float_value(row.get("process_ns_estimate"), 0.0),
         }
+        values = {
+            key: _float_value(value, 0.0)
+            for key, value in row.items()
+            if key not in {"tick", "t_ns"} and _is_numeric(value)
+        }
+        progress["values"] = values
+        progress.update(values)
         detector_events.extend(detector.update(progress))
     return {
         "scene": inspect_scene(scene_dir),
@@ -186,3 +193,11 @@ def _float_value(value: object, default: float) -> float:
         return float(value) if value not in (None, "") else default
     except (TypeError, ValueError):
         return default
+
+
+def _is_numeric(value: object) -> bool:
+    try:
+        float(value)
+    except (TypeError, ValueError):
+        return False
+    return value not in (None, "")

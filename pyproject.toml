@@ -13,6 +13,7 @@ authors = [{name = "dSense contributors"}]
 dependencies = []
 
 [project.optional-dependencies]
+tui = ["textual", "rich"]
 dev = ["pytest>=7", "ruff>=0.6"]
 
 [project.scripts]

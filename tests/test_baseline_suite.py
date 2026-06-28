@@ -75,6 +75,25 @@ def test_startup_baseline_suite_fills_to_target_once(tmp_path: Path, monkeypatch
     assert count_baseline_suite_scenes("base") == 3
 
 
+def test_baseline_suite_emits_recording_progress(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    updates = []
+
+    run_baseline_suite(
+        "base",
+        target_scenes=1,
+        duration=0.03,
+        tick_hz=10,
+        linux=False,
+        assume_yes=True,
+        progress_callback=updates.append,
+    )
+
+    assert updates
+    assert any(update["phase"] == "baseline_suite" and update["status"] == "recording" for update in updates)
+    assert any(update["status"] == "recorded" for update in updates)
+
+
 def test_startup_baseline_suite_fills_missing_with_label_offset(tmp_path: Path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     ensure_startup_baseline_suite("base", target_scenes=2, duration=0.03, tick_hz=10, linux=False)

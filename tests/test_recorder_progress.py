@@ -37,6 +37,61 @@ def test_record_scene_progress_callback_can_add_events(tmp_path):
     assert not [error for error in validate_scene(tmp_path / "scene_000001").errors if error.field == "events"]
 
 
+def test_record_scene_progress_callback_receives_telemetry_snapshot(tmp_path, monkeypatch):
+    class SlowChannel:
+        id = "slow"
+        group = "test"
+        name = "Slow"
+        rate_hz = 1
+        bit = 8
+
+        def available(self):
+            return True
+
+        def start(self):
+            return None
+
+        def sample(self, tick, now_ns):
+            return ChannelSample(self.id, {"slow_value": tick + 10})
+
+        def stop(self):
+            return None
+
+    import dsense.recorder
+
+    monkeypatch.setattr(dsense.recorder, "default_channels", lambda groups=None: [SlowChannel()])
+    calls = []
+
+    def progress(update):
+        calls.append(update)
+        return []
+
+    record_scene(
+        tmp_path / "scene_000001",
+        "scene_000001",
+        "test_interaction",
+        duration=0.2,
+        tick_hz=10,
+        pre_roll=0.05,
+        action=0.1,
+        post_roll=0.05,
+        progress_callback=progress,
+    )
+
+    assert calls
+    first, second = calls
+    assert first["scene_id"] == "scene_000001"
+    assert first["label"] == "test_interaction"
+    assert first["phase"] == "pre-roll"
+    assert "slow_value" in first["values"]
+    assert first["slow_value"] == first["values"]["slow_value"]
+    assert first["sampled_mask"] == first["channel_sampled_mask"]
+    assert first["channels"][0]["id"] == "slow"
+    assert first["channels"][0]["sampled"] is True
+    assert second["channels"][0]["stale"] is True
+    assert second["stale_mask"] & (1 << 8)
+
+
 def test_record_scene_persists_channel_groups(tmp_path):
     scene = record_scene(
         tmp_path / "scene_000001",

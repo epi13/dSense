@@ -1,11 +1,13 @@
 from pathlib import Path
 import csv
 
+from dsense.cli import build_parser
 from dsense.manifest import DEFAULT_PROJECT, init_project
+from dsense.channels.base import ChannelSample
 from dsense.orbiters import evaluate_project_orbiters, make_orbiter_summary, run_scene_orbiters
 from dsense.privacy import build_privacy_report
 from dsense.transfer import compare_transfer_bundle, export_transfer_bundle, transfer_bundle_path
-from dsense.watcher import label_candidate, run_rolling_watcher, run_watcher_scan
+from dsense.watcher import _live_samples, label_candidate, run_rolling_watcher, run_watcher_scan
 from dsense.utils.files import write_json
 
 
@@ -81,6 +83,22 @@ def test_watcher_scan_writes_artifacts(tmp_path, monkeypatch):
     assert Path(result["orbiter_path"]).exists()
 
 
+def test_watcher_parser_accepts_channel_groups():
+    args = build_parser().parse_args(["watcher", "base", "--channels", "portable,linux"])
+
+    assert args.channels == "portable,linux"
+
+
+def test_watcher_scan_persists_channel_groups(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    init_project(DEFAULT_PROJECT)
+
+    result = run_watcher_scan(DEFAULT_PROJECT, duration=0.05, tick_hz=10, channel_groups=["portable", "linux"])
+
+    assert result["scene"]["channel_groups"] == ["portable", "linux"]
+    assert result["event"]["channel_groups"] == ["portable", "linux"]
+
+
 def test_rolling_watcher_saves_triggered_window_and_label(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     root = init_project(DEFAULT_PROJECT)
@@ -108,6 +126,7 @@ def test_rolling_watcher_saves_triggered_window_and_label(tmp_path, monkeypatch)
         tick_hz=10,
         cooldown_seconds=10,
         sample_rows=rows,
+        channel_groups=["portable", "linux"],
     )
 
     assert len(result["saved"]) == 1
@@ -115,6 +134,8 @@ def test_rolling_watcher_saves_triggered_window_and_label(tmp_path, monkeypatch)
     scene = saved["scene"]
     scene_dir = root / "scenes" / scene["scene_id"]
     assert scene["mode"] == "watcher_rolling"
+    assert scene["channel_groups"] == ["portable", "linux"]
+    assert result["session"]["channel_groups"] == ["portable", "linux"]
     assert scene["label"] == "watcher_anomaly_candidate"
     assert scene["accepted"] is False
     assert (scene_dir / "frames.ds64").exists()
@@ -124,6 +145,41 @@ def test_rolling_watcher_saves_triggered_window_and_label(tmp_path, monkeypatch)
 
     assert labeled["label"] == "door_open_close"
     assert labeled["accepted"] is True
+
+
+def test_live_samples_uses_requested_channel_groups(monkeypatch):
+    seen = {}
+
+    class TestChannel:
+        id = "test"
+        name = "Test"
+        group = "linux"
+        rate_hz = 10
+        bit = 13
+
+        def available(self):
+            return True
+
+        def start(self):
+            return None
+
+        def sample(self, tick, now_ns):
+            return ChannelSample(self.id, {"test_value": 42})
+
+        def stop(self):
+            return None
+
+    def fake_default_channels(groups=None):
+        seen["groups"] = groups
+        return [TestChannel()]
+
+    monkeypatch.setattr("dsense.watcher.default_channels", fake_default_channels)
+    samples = _live_samples(10, 100_000_000, ["portable", "linux"])
+    sample = next(samples)
+    samples.close()
+
+    assert seen["groups"] == ["portable", "linux"]
+    assert sample["test_value"] == 42
 
 
 def _write_baseline_preview(root: Path) -> None:

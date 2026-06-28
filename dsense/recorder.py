@@ -10,6 +10,7 @@ from .channels.sleep_jitter import SleepJitterChannel
 from .frame import INT32_MAX, INT32_MIN, build_frame, FRAME_SIZE
 from .inputs import validate_capture_params
 from .quality import summarize_frames
+from .telemetry import build_recording_snapshot
 from .utils.files import ensure_dir, write_json
 from .utils.timebase import monotonic_ns, utc_now_iso
 
@@ -69,6 +70,9 @@ def record_scene(scene_dir: Path, scene_id: str, label: str, duration: float, ti
     frames_path = scene_dir / "frames.ds64"
     start_ns = monotonic_ns()
     next_target = start_ns
+    action_start_ms = int(pre_roll * 1000)
+    action_end_ms = int((pre_roll + (action if action is not None else max(0.0, duration - pre_roll - post_roll))) * 1000)
+    duration_ms = int(duration * 1000)
     try:
         with frames_path.open("wb") as fh:
             for tick in range(expected):
@@ -95,17 +99,25 @@ def record_scene(scene_dir: Path, scene_id: str, label: str, duration: float, ti
                 rows.append(row)
                 if progress_callback is not None:
                     elapsed_ms = int((now - start_ns) / 1_000_000)
-                    progress = {
-                        "tick": tick,
-                        "expected": expected,
-                        "elapsed_ms": elapsed_ms,
-                        "duration_ms": int(duration * 1000),
-                        "availability_mask": availability,
-                        "quality_flags": quality,
-                        "dt_ns": vals.get("dt_ns", 0),
-                        "sleep_drift_ns": vals.get("sleep_drift_ns", 0),
-                        "process_ns_estimate": vals.get("process_ns_estimate", 0),
-                    }
+                    snapshot = build_recording_snapshot(
+                        scene_id=scene_id,
+                        label=label,
+                        tick=tick,
+                        expected=expected,
+                        elapsed_ms=elapsed_ms,
+                        duration_ms=duration_ms,
+                        pre_roll_ms=action_start_ms,
+                        action_end_ms=action_end_ms,
+                        availability_mask=availability,
+                        quality_flags=quality,
+                        sampled_mask=sampled_mask,
+                        stale_mask=stale_mask,
+                        unavailable_mask=unavailable_mask,
+                        values=vals,
+                        runtimes=runtimes,
+                        recent_events=user_events[-12:],
+                    )
+                    progress = snapshot.to_progress_dict()
                     for event in progress_callback(progress) or []:
                         if "event" not in event:
                             continue
@@ -121,13 +133,11 @@ def record_scene(scene_dir: Path, scene_id: str, label: str, duration: float, ti
         extra = sorted(field for field in preview_fields if field not in fixed)
         writer = csv.DictWriter(f, fieldnames=fixed + extra)
         writer.writeheader(); writer.writerows(rows)
-    action_start_ms = int(pre_roll * 1000)
-    action_end_ms = int((pre_roll + (action if action is not None else max(0.0, duration - pre_roll - post_roll))) * 1000)
     events = [
         {"t_ms": 0, "event": "scene_start"},
         {"t_ms": action_start_ms, "event": "action_start"},
         {"t_ms": action_end_ms, "event": "action_end"},
-        {"t_ms": int(duration * 1000), "event": "scene_end"},
+        {"t_ms": duration_ms, "event": "scene_end"},
     ]
     events.extend(user_events)
     events = sorted(events, key=lambda e: (int(e.get("t_ms", 0)), e.get("event") == "scene_end"))
@@ -136,7 +146,7 @@ def record_scene(scene_dir: Path, scene_id: str, label: str, duration: float, ti
     sha = hashlib.sha256(frames_path.read_bytes()).hexdigest()
     (scene_dir / "checksum.txt").write_text(f"sha256  frames.ds64  {sha}\nframe_size_bytes  {FRAME_SIZE}\n", encoding="utf-8")
     quality_summary = summarize_frames(frames_path, expected, interval_ns).to_dict()
-    scene = {"scene_id": scene_id, "label": label, "created_utc": utc_now_iso(), "duration_ms": int(duration * 1000), "tick_hz": tick_hz,
+    scene = {"scene_id": scene_id, "label": label, "created_utc": utc_now_iso(), "duration_ms": duration_ms, "tick_hz": tick_hz,
              "frame_size_bytes": FRAME_SIZE, "mode": mode, "machine_state": {}, "pre_roll_ms": int(pre_roll * 1000),
              "action_start_ms": action_start_ms, "action_end_ms": action_end_ms, "post_roll_ms": int(post_roll * 1000),
              "channel_groups": selected_groups,

@@ -18,6 +18,7 @@ class DetectorState:
 class HeuristicEventDetector:
     tick_hz: int
     learned_baseline: dict[str, dict[str, float]] | None = None
+    watched_channels: list[str] | tuple[str, ...] | set[str] | None = None
     threshold: float = 6.0
     cooldown_ms: int = 900
     warmup_samples: int | None = None
@@ -29,27 +30,23 @@ class HeuristicEventDetector:
     def __post_init__(self) -> None:
         if self.warmup_samples is None:
             self.warmup_samples = max(12, min(80, int(self.tick_hz * 0.75)))
-        self._windows = {
-            "dt_ns": deque(maxlen=self.window_size),
-            "sleep_drift_ns": deque(maxlen=self.window_size),
-            "process_ns_estimate": deque(maxlen=self.window_size),
-        }
+        self._windows = {name: deque(maxlen=self.window_size) for name in self._initial_channels()}
         self.state.threshold = self.threshold
 
     def update(self, progress: dict[str, object]) -> list[dict[str, object]]:
-        values = {
-            "dt_ns": float(progress.get("dt_ns", 0) or 0),
-            "sleep_drift_ns": abs(float(progress.get("sleep_drift_ns", 0) or 0)),
-            "process_ns_estimate": float(progress.get("process_ns_estimate", 0) or 0),
-        }
+        values = self._watched_values(progress)
         elapsed_ms = int(progress.get("elapsed_ms", 0) or 0)
         samples = int(progress.get("tick", 0) or 0) + 1
 
         scores = {}
         for name, value in values.items():
-            local_score = self._robust_score(value, self._windows[name])
+            window = self._windows.setdefault(name, deque(maxlen=self.window_size))
+            local_score = self._robust_score(value, window)
             learned_score = self._learned_score(name, value)
             scores[name] = max(local_score, learned_score)
+        if not scores:
+            self.state = DetectorState(score=0.0, channel="no_numeric_channels", status=self._status(0.0, samples), threshold=self.threshold, samples=samples)
+            return []
         channel, score = max(scores.items(), key=lambda item: item[1])
         self.state = DetectorState(
             score=round(score, 2),
@@ -60,7 +57,7 @@ class HeuristicEventDetector:
         )
 
         for name, value in values.items():
-            self._windows[name].append(value)
+            self._windows.setdefault(name, deque(maxlen=self.window_size)).append(value)
 
         if samples < int(self.warmup_samples or 0):
             return []
@@ -96,6 +93,45 @@ class HeuristicEventDetector:
         center = float(profile.get("center", 0.0))
         mad = float(profile.get("mad", 1.0)) or 1.0
         return abs(value - center) / mad
+
+    def _initial_channels(self) -> list[str]:
+        watched = self._watched_channel_set()
+        if watched is not None:
+            return sorted(watched)
+        if self.learned_baseline:
+            return sorted(str(name) for name in self.learned_baseline)
+        return ["dt_ns", "sleep_drift_ns", "process_ns_estimate"]
+
+    def _watched_values(self, progress: dict[str, object]) -> dict[str, float]:
+        watched = self._watched_channel_set()
+        if watched is None and self.learned_baseline:
+            watched = {str(name) for name in self.learned_baseline}
+        names = watched or {"dt_ns", "sleep_drift_ns", "process_ns_estimate"}
+        values: dict[str, float] = {}
+        nested = progress.get("values", {})
+        nested_values = nested if isinstance(nested, dict) else {}
+        for name in sorted(names):
+            raw = nested_values.get(name, progress.get(name))
+            numeric = self._numeric_value(raw)
+            if numeric is None:
+                continue
+            values[name] = abs(numeric) if name == "sleep_drift_ns" else numeric
+        return values
+
+    def _watched_channel_set(self) -> set[str] | None:
+        if self.watched_channels is None:
+            return None
+        return {str(name) for name in self.watched_channels}
+
+    def _numeric_value(self, value: object) -> float | None:
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        try:
+            return float(str(value))
+        except (TypeError, ValueError):
+            return None
 
     def _status(self, score: float, samples: int) -> str:
         if samples < int(self.warmup_samples or 0):

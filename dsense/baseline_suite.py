@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import random
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -154,6 +155,7 @@ def run_baseline_suite(
     include_network: bool = False,
     include_heavy: bool = False,
     label_offset: int = 0,
+    progress_callback: Callable[[dict[str, object]], None] | None = None,
 ) -> dict[str, object]:
     validate_capture_params(duration, tick_hz)
     init_project(project_name)
@@ -178,13 +180,41 @@ def run_baseline_suite(
     suite_id = f"suite_{utc_now_iso().replace(':', '').replace('-', '').replace('.', '')}_{uuid.uuid4().hex[:8]}"
     recorded: list[dict[str, object]] = []
     failed: list[dict[str, object]] = []
-    for item in list(plan["scenarios"]):
+    scenarios = list(plan["scenarios"])
+    for index, item in enumerate(scenarios, start=1):
+        scene_id = ""
         try:
             scene_id = allocate_scene_id(project_name)
             scene_dir = project_path(project_name) / "scenes" / scene_id
             item_duration = float(item["duration"])
             workload = item.get("workload")
-            callback = workload_progress_callback(str(workload) if workload else None, 0.0, item_duration)
+            _emit_progress(progress_callback, {
+                "phase": "baseline_suite",
+                "status": "recording",
+                "current": index,
+                "target": len(scenarios),
+                "scene_id": scene_id,
+                "label": str(item["label"]),
+                "elapsed_ms": 0,
+                "duration_ms": int(item_duration * 1000),
+            })
+
+            def suite_progress(update: dict[str, object]) -> list[dict[str, object]]:
+                _emit_progress(progress_callback, {
+                    "phase": "baseline_suite",
+                    "status": "recording",
+                    "current": index,
+                    "target": len(scenarios),
+                    "scene_id": scene_id,
+                    "label": str(item["label"]),
+                    "elapsed_ms": update.get("elapsed_ms", 0),
+                    "duration_ms": update.get("duration_ms", int(item_duration * 1000)),
+                    "tick": update.get("tick", 0),
+                    "expected": update.get("expected", 1),
+                })
+                return []
+
+            workload_callback = workload_progress_callback(str(workload) if workload else None, 0.0, item_duration, suite_progress)
             scene = record_scene(
                 scene_dir,
                 scene_id,
@@ -196,15 +226,34 @@ def run_baseline_suite(
                 0.0,
                 "Automatic baseline-suite negative control; no intentional physical interaction.",
                 mode="baseline_suite",
-                progress_callback=callback,
+                progress_callback=workload_callback,
                 channel_groups=channel_groups,
             )
             scene["suite"] = {"suite_id": suite_id, **item}
             scene["accepted"] = True
             write_json(scene_dir / "scene.json", scene)
             recorded.append({"scene_id": scene_id, **item})
+            _emit_progress(progress_callback, {
+                "phase": "baseline_suite",
+                "status": "recorded",
+                "current": index,
+                "target": len(scenarios),
+                "scene_id": scene_id,
+                "label": str(item["label"]),
+                "elapsed_ms": int(item_duration * 1000),
+                "duration_ms": int(item_duration * 1000),
+            })
         except Exception as exc:
             failed.append({"scenario": item, "error": str(exc)})
+            _emit_progress(progress_callback, {
+                "phase": "baseline_suite",
+                "status": "failed",
+                "current": index,
+                "target": len(scenarios),
+                "scene_id": scene_id,
+                "label": str(item.get("label", "?")),
+                "error": str(exc),
+            })
 
     baseline_model = train_and_save_project_baseline(project_name)
     classifier_model = train_and_save_project_classifier(project_name)
@@ -323,3 +372,8 @@ def ensure_startup_baseline_suite(
         "message": f"Startup system suite: recorded {recorded} scenes ({existing + recorded}/{target_scenes})",
         "report": report,
     }
+
+
+def _emit_progress(callback: Callable[[dict[str, object]], None] | None, update: dict[str, object]) -> None:
+    if callback is not None:
+        callback(update)

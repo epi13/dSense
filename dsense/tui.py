@@ -1,62 +1,69 @@
 from __future__ import annotations
 
 import curses
-import textwrap
 import time
-from dataclasses import dataclass
+from collections import deque
 
-from .autotest import validate_dataset
-from .baseline import BaselineModel, train_and_save_project_baseline
-from .classifier import SceneClassifierModel, train_and_save_project_classifier
+from .baseline import BaselineModel, default_auto_baseline_policy, load_project_baseline, project_has_usable_baseline
+from .baseline_suite import count_baseline_suite_scenes, run_baseline_suite
+from .classifier import SceneClassifierModel, load_project_classifier
+from .council import load_intelligence_state, run_intelligence_update
+from .doctor import doctor_ok, run_doctor
 from .event_detector import DetectorState, HeuristicEventDetector
 from .gemma_edge import gemma_edge_status
 from .manifest import allocate_scene_id, init_project, project_path, scan_channels
 from .orbiters import read_recent_orbiter_summaries
 from .recorder import record_scene
 from .scenarios import SCENARIO_GROUPS
-from .transfer import export_transfer_bundle, transfer_bundle_path
+from .transfer import transfer_bundle_path
+from .timeseries import TimeSeriesModel, load_project_timeseries
+from .tui_jobs import TuiJobManager, evaluate_project_job, export_transfer_job, run_watcher_job, train_baseline, train_classifier, update_intelligence_job, validate_project
+from .tui_render import (
+    MIN_TUI_HEIGHT,
+    MIN_TUI_WIDTH,
+    TABS,
+    channel_state_label,
+    classifier_summary_lines,
+    clip_text,
+    council_summary_lines,
+    evaluation_repeatability_lines,
+    format_metric_value,
+    labels_needing_more_takes,
+    profile_line,
+    robust_channel_score,
+    scene_detail_lines,
+    scheduled_scene_events,
+    summarize_scene_counts,
+    sparkline,
+    system_event_marker,
+    tab_index_delta,
+    useful_channel_lines,
+    value_channel_id,
+    wrap_text,
+)
+from .tui_state import CaptureConfig
 from .utils.files import read_json, write_json
-from .watcher import read_recent_watcher_events, run_watcher_scan
+from .watcher import read_recent_watcher_events
 from .workloads import workload_progress_callback
-
-
-TABS = ["Record", "Scenes", "Channels", "Learn", "Classify", "Watcher", "Orbiters", "Transfer", "Validate", "Help"]
-MIN_TUI_HEIGHT = 18
-MIN_TUI_WIDTH = 60
-
-
-@dataclass
-class CaptureConfig:
-    project_name: str
-    mode: str = "user"
-    scenario_index: int = 0
-    record_group: bool = False
-    auto_detect: bool = True
-    label: str = "user_interaction"
-    duration: float = 10.0
-    pre_roll: float = 2.0
-    action: float = 5.0
-    post_roll: float = 3.0
-    repeat: int = 1
-    tick_hz: int = 100
-    notes: str = ""
-    workload_id: str | None = None
-    startup_baseline_status: str = ""
 
 
 class SceneRecorderTUI:
     def __init__(self, screen, config: CaptureConfig):
         self.screen = screen
         self.config = config
-        self.channels = scan_channels()
+        self.channels = scan_channels(groups=self.config.channel_groups)
         self.scenes = load_project_scenes(config.project_name)
-        self.baseline = self._train_baseline()
-        self.classifier = self._train_classifier()
+        self.baseline: BaselineModel | None = None
+        self.classifier: SceneClassifierModel | None = None
+        self.timeseries: TimeSeriesModel | None = None
+        self.intelligence_state: dict[str, object] | None = load_intelligence_state(config.project_name)
         self.tab_index = 0
         self.phase_index = 0
         self.scene_index = max(0, len(self.scenes) - 1)
         self.scene_scroll = 0
         self.last_validation_result = None
+        self.evaluation_report: dict[str, object] | None = None
+        self.job_manager = TuiJobManager(config.project_name)
         self.validation_summary = "not run"
         self.watcher_summary = "idle"
         self.transfer_summary = "not exported"
@@ -64,29 +71,27 @@ class SceneRecorderTUI:
         self.events: list[dict[str, object]] = []
         self.live_events: list[dict[str, object]] = []
         self.latest: dict[str, object] = {}
+        self.channel_history: dict[str, deque[float]] = {}
         self.detector_state = DetectorState()
         self.last_draw = 0.0
         self._apply_selected_scenario()
 
     def _train_classifier(self) -> SceneClassifierModel | None:
-        try:
-            model = train_and_save_project_classifier(self.config.project_name)
-        except (OSError, ValueError):
-            return None
-        return model if model.scene_count else None
+        return train_classifier(self.config.project_name)
 
     def _train_baseline(self) -> BaselineModel | None:
-        try:
-            model = train_and_save_project_baseline(self.config.project_name)
-        except (OSError, ValueError):
-            return None
-        return model if model.scene_count else None
+        return train_baseline(self.config.project_name)
+
+    def _load_classifier(self) -> SceneClassifierModel | None:
+        return load_project_classifier(self.config.project_name)
 
     def run(self) -> list[dict[str, object]]:
         curses.curs_set(0)
         self.screen.nodelay(False)
         self.screen.keypad(True)
+        self.screen.timeout(250)
         self._setup_colors()
+        self._run_startup_pipeline()
         all_results = []
         while True:
             if not self._configure():
@@ -107,6 +112,7 @@ class SceneRecorderTUI:
             self.events = []
             self.live_events = []
             self.latest = {}
+            self.channel_history = {}
             self.messages = [
                 f"Take {take}/{len(queue)}",
                 "Press SPACE to mark an interaction. Press n to mark noise. Press q to flag review.",
@@ -134,7 +140,193 @@ class SceneRecorderTUI:
         curses.init_pair(4, curses.COLOR_RED, -1)
         curses.init_pair(5, curses.COLOR_MAGENTA, -1)
 
+    def _run_startup_pipeline(self) -> None:
+        if not self.config.startup_intelligence:
+            init_project(self.config.project_name)
+            self.channels = scan_channels(groups=self.config.channel_groups)
+            self.scenes = load_project_scenes(self.config.project_name)
+            self.baseline = load_project_baseline(self.config.project_name)
+            self.classifier = self._load_classifier()
+            self.timeseries = load_project_timeseries(self.config.project_name)
+            self.config.startup_baseline_status = "Startup intelligence disabled for this session."
+            self.messages.append(self.config.startup_baseline_status)
+            self._draw_startup_pipeline([
+                {"key": "disabled", "label": "Startup intelligence disabled for this session.", "status": "skipped", "detail": "existing artifacts loaded"},
+                {"key": "dashboard", "label": "open dashboard", "status": "done", "detail": "ready"},
+            ])
+            time.sleep(0.4)
+            return
+
+        self._run_council_startup_pipeline()
+
+    def _run_council_startup_pipeline(self) -> None:
+        steps = [
+            {"key": "doctor", "label": "doctor", "status": "pending", "detail": ""},
+            {"key": "intelligence", "label": "update intelligence", "status": "pending", "detail": ""},
+            {"key": "dashboard", "label": "open dashboard", "status": "pending", "detail": ""},
+        ]
+
+        def set_step(key: str, status: str, detail: str = "") -> None:
+            for step in steps:
+                if step["key"] == key:
+                    step["status"] = status
+                    step["detail"] = detail
+                    break
+            self._draw_startup_pipeline(steps)
+
+        set_step("doctor", "active")
+        checks = run_doctor(self.config.project_name)
+        set_step("doctor", "done" if doctor_ok(checks) else "warn", f"{sum(1 for check in checks if check.status != 'ok')} warnings")
+
+        set_step("intelligence", "active", "starting")
+        started = time.monotonic()
+        council_steps: list[dict[str, object]] = []
+
+        def progress(update: dict[str, object]) -> None:
+            step = dict(update.get("step", {}))
+            name = str(step.get("name", ""))
+            status = str(step.get("status", "pending"))
+            detail = _step_detail(step)
+            existing = next((item for item in council_steps if item.get("key") == name), None)
+            row = {"key": name, "label": name.replace("_", " "), "status": _ui_status(status), "detail": detail}
+            if existing is None:
+                council_steps.append(row)
+            else:
+                existing.update(row)
+            self._draw_startup_pipeline([steps[0], *council_steps[-10:], steps[-1]])
+
+        state = run_intelligence_update(
+            self.config.project_name,
+            startup=True,
+            run_watchers=self.config.startup_watchers,
+            run_orbiters=self.config.startup_orbiters,
+            run_training=self.config.startup_training,
+            run_transfer=True,
+            progress_callback=progress,
+        )
+        self.intelligence_state = state
+        self.baseline = load_project_baseline(self.config.project_name)
+        self.classifier = self._load_classifier()
+        self.timeseries = load_project_timeseries(self.config.project_name)
+        self.validation_summary = self._validation_summary_from_state(state)
+        self.evaluation_report = dict(dict(state.get("models", {})).get("evaluation", {}))
+        status = str(state.get("status", "unknown"))
+        council = dict(state.get("council", {}))
+        detail = f"{status} confidence={council.get('overall_confidence', 0.0)}"
+        self.job_manager.add_completed("update intelligence", detail, "done" if status in {"ok", "warning"} else "error", time.monotonic() - started)
+
+        self.scenes = load_project_scenes(self.config.project_name)
+        set_step("dashboard", "done", "ready")
+        time.sleep(0.4)
+
+    def _run_startup_baseline_step(self, set_step) -> None:
+        policy = default_auto_baseline_policy() if self.config.auto_baseline_policy == "auto" else self.config.auto_baseline_policy
+        if policy == "off":
+            self.config.startup_baseline_status = "Startup baseline: skipped by policy off"
+            set_step("startup_baseline", "skipped", "policy off")
+            return
+        if policy == "missing-only" and not self.config.force_auto_baseline and project_has_usable_baseline(self.config.project_name):
+            self.config.startup_baseline_status = "Startup baseline: reused existing model"
+            set_step("startup_baseline", "done", "reused existing model")
+            return
+        try:
+            started = time.monotonic()
+            scene_id = allocate_scene_id(self.config.project_name)
+            duration = max(0.01, float(self.config.auto_baseline_duration))
+
+            def progress(update: dict[str, object]) -> list[dict[str, object]]:
+                elapsed_ms = int(update.get("elapsed_ms", 0) or 0)
+                duration_ms = int(update.get("duration_ms", int(duration * 1000)) or 1)
+                set_step("startup_baseline", "active", f"recording {scene_id}  {elapsed_ms / 1000:0.1f}s / {duration_ms / 1000:0.1f}s")
+                return []
+
+            set_step("startup_baseline", "active", f"recording {scene_id}  0.0s / {duration:0.1f}s")
+            record_scene(
+                project_path(self.config.project_name) / "scenes" / scene_id,
+                scene_id,
+                "baseline_startup_auto",
+                duration,
+                max(1, self.config.tick_hz),
+                0.0,
+                duration,
+                0.0,
+                "Automatically recorded startup baseline when dSense TUI opened.",
+                mode="baseline_auto",
+                progress_callback=progress,
+                channel_groups=self.config.channel_groups,
+            )
+            self.config.startup_baseline_status = f"Startup baseline: recorded {scene_id}"
+            set_step("startup_baseline", "done", f"recorded {scene_id}")
+            self.job_manager.add_completed("startup baseline", f"recorded {scene_id}", "done", time.monotonic() - started)
+        except Exception as exc:
+            self.config.startup_baseline_status = f"Startup baseline: failed: {exc}"
+            set_step("startup_baseline", "warn", f"failed: {exc}")
+            self.job_manager.add_completed("startup baseline", f"failed: {exc}", "error")
+
+    def _run_startup_suite_step(self, set_step) -> None:
+        if not self.config.startup_suite_enabled:
+            set_step("baseline_suite", "skipped", "disabled")
+            return
+        existing = count_baseline_suite_scenes(self.config.project_name)
+        target = max(1, int(self.config.startup_suite_target))
+        if existing >= target:
+            set_step("baseline_suite", "done", f"{existing} / {target} scenes")
+            return
+        missing = target - existing
+
+        def progress(update: dict[str, object]) -> None:
+            current = existing + int(update.get("current", 0) or 0)
+            scene_id = str(update.get("scene_id", "") or "")
+            elapsed_ms = int(update.get("elapsed_ms", 0) or 0)
+            duration_ms = int(update.get("duration_ms", 0) or 0)
+            timing = f"  {elapsed_ms / 1000:0.1f}s / {duration_ms / 1000:0.1f}s" if duration_ms else ""
+            detail = f"{current} / {target} scenes"
+            if scene_id:
+                detail += f"  {scene_id}{timing}"
+            set_step("baseline_suite", "active", detail)
+
+        set_step("baseline_suite", "active", f"{existing} / {target} scenes")
+        try:
+            started = time.monotonic()
+            report = run_baseline_suite(
+                self.config.project_name,
+                target_scenes=missing,
+                seed=self.config.startup_suite_seed,
+                duration=self.config.startup_suite_duration,
+                tick_hz=self.config.tick_hz,
+                linux=self.config.startup_suite_linux,
+                assume_yes=True,
+                label_offset=existing,
+                progress_callback=progress,
+            )
+            recorded = int(report.get("actual_scene_count", 0) or 0)
+            set_step("baseline_suite", "done", f"{existing + recorded} / {target} scenes")
+            self.job_manager.add_completed("baseline-suite fill", f"{existing + recorded} / {target} scenes", "done", time.monotonic() - started)
+        except Exception as exc:
+            set_step("baseline_suite", "warn", f"failed: {exc}")
+            self.job_manager.add_completed("baseline-suite fill", f"failed: {exc}", "error")
+
+    def _draw_startup_pipeline(self, steps: list[dict[str, object]]) -> None:
+        self.screen.erase()
+        h, w = self.screen.getmaxyx()
+        self._title("Startup Pipeline", self.config.project_name)
+        self._add(2, 2, "dSense is preparing the project. Long startup work is shown here as it happens.")
+        row = 4
+        for step in steps:
+            if row >= h - 2:
+                break
+            status = str(step.get("status", "pending"))
+            marker = {"done": "[x]", "active": "[>]", "warn": "[!]", "skipped": "[-]"}.get(status, "[ ]")
+            color = self._color(2 if status == "done" else 1 if status == "active" else 3 if status in {"warn", "skipped"} else 0)
+            detail = str(step.get("detail", "") or "")
+            label = str(step.get("label", ""))
+            suffix = f": {detail}" if detail else ""
+            self._add(row, 4, clip_text(f"{marker} {label}{suffix}", max(1, w - 8)), color)
+            row += 1
+        self.screen.refresh()
+
     def _configure(self) -> bool:
+        self.screen.timeout(250)
         fields = [
             ("mode", "Mode"),
             ("scenario", "Preset"),
@@ -153,6 +345,8 @@ class SceneRecorderTUI:
         while True:
             self._draw_config(fields, idx)
             key = self.screen.getch()
+            if key == -1:
+                continue
             current_tab = TABS[self.tab_index]
             if key == 9:
                 self._cycle_tab(1)
@@ -198,19 +392,19 @@ class SceneRecorderTUI:
             elif key in (ord("s"), ord("S")):
                 self.config.duration = self.config.pre_roll + self.config.action + self.config.post_roll
             elif key in (ord("r"), ord("R")):
-                self.channels = scan_channels()
+                self.channels = scan_channels(groups=self.config.channel_groups)
+            elif key in (ord("u"), ord("U")):
+                self._start_intelligence_job()
             elif key in (ord("t"), ord("T")):
-                self.baseline = self._train_baseline()
-                self.classifier = self._train_classifier()
+                self._start_training_jobs()
             elif key in (ord("v"), ord("V")):
-                self.validation_summary = self._validate_project_summary()
+                self._start_validate_job()
             elif key in (ord("w"), ord("W")):
-                self.watcher_summary = self._run_watcher_summary()
-                self.scenes = load_project_scenes(self.config.project_name)
-                self.baseline = self._train_baseline()
-                self.classifier = self._train_classifier()
+                self._start_watcher_job()
             elif key in (ord("e"), ord("E")):
-                self.transfer_summary = self._export_transfer_summary()
+                self._start_export_job()
+            elif current_tab == "Jobs" and key in (ord("x"), ord("X")):
+                self.job_manager.cancel_running()
             elif key in (ord("c"), ord("C")):
                 if current_tab == "Record":
                     return True
@@ -233,10 +427,16 @@ class SceneRecorderTUI:
             self._draw_scenes_tab(3, h, w)
         elif tab == "Channels":
             self._draw_channels_tab(3, h, w)
+        elif tab == "Council":
+            self._draw_council_tab(3, h, w)
         elif tab == "Learn":
             self._draw_learn_tab(3, h, w)
         elif tab == "Classify":
             self._draw_classify_tab(3, h, w)
+        elif tab == "Evaluation":
+            self._draw_evaluation_tab(3, h, w)
+        elif tab == "Jobs":
+            self._draw_jobs_tab(3, h, w)
         elif tab == "Watcher":
             self._draw_watcher_tab(3, h, w)
         elif tab == "Orbiters":
@@ -247,7 +447,7 @@ class SceneRecorderTUI:
             self._draw_validate_tab(3, h, w)
         elif tab == "Help":
             self._draw_help_tab(3, h, w)
-        self._add(h - 2, 2, "TAB tabs | 1-0 jump | c record | t train | v validate | w watcher | e export | q exit")
+        self._add(h - 2, 2, "TAB tabs | c record | u update intelligence | v validate | e export | q exit")
         self.screen.refresh()
 
     def _draw_tabs(self, y: int, x: int, width: int) -> None:
@@ -365,7 +565,7 @@ class SceneRecorderTUI:
         panel_h = max(4, h - y - 4)
         self._box(y, 0, panel_h, w - 1, "Learn")
         if self.baseline is None:
-            self._add(y + 2, 2, "Baseline model not trained. Press t to train.")
+            self._add(y + 2, 2, "Baseline model not trained. Press u to update intelligence.")
             return
         self._add(y + 2, 2, f"Baseline scenes: {self.baseline.scene_count}")
         self._add(y + 3, 2, f"Trained: {self.baseline.trained_utc}")
@@ -373,6 +573,18 @@ class SceneRecorderTUI:
         self._add(y + 6, 2, "Channel                         center          MAD          p95          p99")
         for i, (channel, profile) in enumerate(sorted(self.baseline.channels.items())[:max(1, panel_h - 9)]):
             self._add(y + 8 + i, 2, profile_line(channel, profile))
+
+    def _draw_council_tab(self, y: int, h: int, w: int) -> None:
+        panel_h = max(4, h - y - 4)
+        self._box(y, 0, panel_h, w - 1, "Intelligence Council")
+        if not self.config.startup_intelligence:
+            self._add(y + 1, 2, "Startup intelligence disabled for this session.", self._color(3))
+        state = self.intelligence_state or load_intelligence_state(self.config.project_name)
+        self.intelligence_state = state
+        for i, line in enumerate(council_summary_lines(state, max(1, panel_h - 5))[:max(1, panel_h - 3)]):
+            if y + 2 + i >= y + panel_h - 1:
+                break
+            self._add(y + 2 + i, 2, clip_text(line, max(1, w - 4)), self._color(3 if "Warning" in line or line.startswith("  -") else 0))
 
     def _draw_classify_tab(self, y: int, h: int, w: int) -> None:
         panel_h = max(4, h - y - 4)
@@ -386,11 +598,66 @@ class SceneRecorderTUI:
             for i, (label, count) in enumerate(sorted(self.classifier.label_counts.items(), key=lambda item: (-item[1], item[0]))[:max(1, h - row - 4)]):
                 self._add(row + 2 + i, 4, f"{label}: {count}")
 
+    def _draw_evaluation_tab(self, y: int, h: int, w: int) -> None:
+        panel_h = max(4, h - y - 4)
+        self._box(y, 0, panel_h, w - 1, "Evaluation")
+        report = self.evaluation_report or self._evaluate_project()
+        self.evaluation_report = report
+        row = y + 2
+        self._add(row, 2, "Repeatability", curses.A_BOLD | self._color(1))
+        row += 1
+        for line in evaluation_repeatability_lines(report):
+            if row >= y + panel_h - 2:
+                return
+            self._add(row, 4, line)
+            row += 1
+        row += 1
+        if row >= y + panel_h - 2:
+            return
+        self._add(row, 2, "Labels needing more takes", curses.A_BOLD | self._color(1))
+        row += 1
+        for label, reason in labels_needing_more_takes(report, max(1, (panel_h // 3))):
+            if row >= y + panel_h - 2:
+                return
+            color = self._color(3 if label != "none" else 2)
+            self._add(row, 4, clip_text(f"{label:<26} {reason}", max(1, w - 8)), color)
+            row += 1
+        row += 1
+        if row >= y + panel_h - 2:
+            return
+        self._add(row, 2, "Useful channels", curses.A_BOLD | self._color(1))
+        row += 1
+        for line in useful_channel_lines(report, max(1, y + panel_h - 2 - row)):
+            if row >= y + panel_h - 2:
+                return
+            self._add(row, 4, clip_text(line, max(1, w - 8)), self._color(2))
+            row += 1
+
+    def _draw_jobs_tab(self, y: int, h: int, w: int) -> None:
+        panel_h = max(4, h - y - 4)
+        self._box(y, 0, panel_h, w - 1, "Jobs")
+        self._add(y + 1, 2, "Press u/v/e to start jobs. Press x to request cancellation of the latest running job.")
+        self._add(y + 3, 2, "status  job                  duration  detail")
+        row = y + 5
+        jobs = self.job_manager.snapshot()
+        if not jobs:
+            self._add(row, 4, "No jobs yet.")
+            return
+        for job in jobs[-max(1, panel_h - 7):]:
+            if row >= y + panel_h - 1:
+                break
+            color = self._color(2 if job.status == "done" else 3 if job.status in {"run", "cancelled"} else 4 if job.status == "error" else 0)
+            status = f"[{job.status[:4]:<4}]"
+            detail = job.error or job.detail
+            line = f"{status:<7} {job.name:<20} {job.duration_s:>6.2f}s  {detail}"
+            self._add(row, 2, clip_text(line, max(1, w - 4)), color)
+            row += 1
+
     def _draw_watcher_tab(self, y: int, h: int, w: int) -> None:
         panel_h = max(4, h - y - 4)
         self._box(y, 0, panel_h, w - 1, "Watcher")
         self._add(y + 2, 2, f"Status: {self.watcher_summary}")
-        self._add(y + 3, 2, "Press w to run a watcher scan.")
+        self._add(y + 3, 2, "Press u to update the full local intelligence stack.")
         self._add(y + 5, 2, "Recent events:")
         events = read_recent_watcher_events(self.config.project_name, max(1, panel_h - 8))
         for i, event in enumerate(events):
@@ -426,7 +693,7 @@ class SceneRecorderTUI:
         panel_h = max(4, h - y - 4)
         self._box(y, 0, panel_h, w - 1, "Validate")
         self._add(y + 2, 2, f"Last validation: {self.validation_summary}")
-        self._add(y + 3, 2, "Press v to validate the dataset.")
+        self._add(y + 3, 2, "Press u for full update or v for validation only.")
         result = self.last_validation_result
         if result is None:
             return
@@ -444,9 +711,9 @@ class SceneRecorderTUI:
         self._box(y, 0, panel_h, w - 1, "Help")
         text = (
             "Tabs: Record configures captures; Scenes inspects recorded scene metadata; Channels shows signal adapters; "
-            "Learn and Classify show trained local models; Watcher runs anomaly scans; Orbiters shows local evidence summaries; "
+            "Council coordinates local evidence layers; Learn and Classify show trained local models; Evaluation answers repeatability and separation questions; Watcher shows anomaly scans; Orbiters shows local evidence summaries; "
             "Transfer exports local bundles; Validate checks dataset health. Hotkeys: TAB next tab, Shift+TAB or left previous tab, "
-            "1-0 jump tabs, c start recording from Record, t train, v validate, w watcher, e export, q exit setup. "
+            "1-0 jump tabs, c start recording from Record, u update intelligence, v validate, e export, q exit setup. "
             "Scene modes: user scenes need a person during action; baseline scenes mean no intentional event; activity scenes are controlled machine-internal labels. "
             "Pre-roll is control time, action is the labeled window, post-roll is settling time. dSense is local substrate-signal capture and should not be overinterpreted."
         )
@@ -570,6 +837,7 @@ class SceneRecorderTUI:
         return [None] * self.config.repeat
 
     def _confirm_ready(self) -> None:
+        self.screen.timeout(-1)
         self.screen.erase()
         self._title("dSense Interaction Recorder", "Ready")
         self._add(3, 2, f"Project: {self.config.project_name}")
@@ -613,6 +881,7 @@ class SceneRecorderTUI:
 
         def ui_progress(update: dict[str, object]) -> list[dict[str, object]]:
             self.latest = update
+            self._update_channel_history(update)
             elapsed_ms = int(update.get("elapsed_ms", 0))
             expected = int(update.get("expected", 1))
             tick = int(update.get("tick", 0))
@@ -621,6 +890,13 @@ class SceneRecorderTUI:
             self._refresh_system_events(elapsed_ms)
             detected = detector.update(update) if self.config.auto_detect else []
             self.detector_state = detector.state
+            update["detector"] = {
+                "score": self.detector_state.score,
+                "channel": self.detector_state.channel,
+                "status": self.detector_state.status,
+                "threshold": self.detector_state.threshold,
+                "samples": self.detector_state.samples,
+            }
             marked: list[dict[str, object]] = []
             while True:
                 key = self.screen.getch()
@@ -638,6 +914,7 @@ class SceneRecorderTUI:
                 shown = dict(event)
                 shown.setdefault("source", "user")
                 self.live_events.append(shown)
+            update["recent_events"] = self.live_events[-12:]
             now = time.monotonic()
             if now - self.last_draw > 0.05:
                 self.last_draw = now
@@ -669,6 +946,7 @@ class SceneRecorderTUI:
             self.config.post_roll,
             self.config.notes,
             progress_callback=progress,
+            channel_groups=self.config.channel_groups,
         )
         if self.config.workload_id:
             scene["scenario"] = {
@@ -706,41 +984,134 @@ class SceneRecorderTUI:
         self.screen.erase()
         elapsed = int(self.latest.get("elapsed_ms", 0))
         duration = max(1, int(self.latest.get("duration_ms", int(self.config.duration * 1000))))
-        pct = min(1.0, elapsed / duration)
         tick = int(self.latest.get("tick", 0)) + 1
         expected = int(self.latest.get("expected", 1))
+        phase = str(self.latest.get("phase") or self._phase(elapsed))
+        actual_elapsed = max(1, elapsed) / 1000
+        rate_hz = tick / actual_elapsed
+        self._title("dSense Observatory", f"Take {take}")
 
-        total_events = len(self.live_events)
-        manual_events = sum(1 for event in self.events if event.get("source", "user") == "user" or event.get("event") in {"user_interaction_marker", "noise_marker", "review_flag"})
-        auto_events = sum(1 for event in self.events if event.get("source") == "heuristic")
-        self._title("Recording Interaction", f"Take {take}")
-        self._box(2, 0, 7, w - 1, "Live overview")
-        self._add(4, 2, f"{self.config.label}  {elapsed / 1000:5.1f}s / {duration / 1000:5.1f}s")
-        self._draw_bar(5, 2, max(10, w - 4), pct)
-        self._add(6, 2, f"Frames {tick}/{expected} | Events {total_events} ({auto_events} auto, {manual_events} manual) | Availability mask {self.latest.get('availability_mask', 0)}")
+        self._box(1, 0, 4, w - 1, "Session")
+        self._add(2, 2, clip_text(f"Project: {self.config.project_name:<12} Scene: {self.latest.get('scene_id', '?'):<16} Label: {self.config.label}", max(1, w - 4)))
+        self._add(3, 2, clip_text(f"Phase: {phase.upper():<10} {elapsed / 1000:0.1f}s / {duration / 1000:0.1f}s    Frames: {tick}/{expected}    Rate: {rate_hz:0.1f}Hz", max(1, w - 4)))
 
-        left_w = max(30, w // 2)
-        self._box(10, 0, 9, left_w, "Timing")
-        self._metric(12, 2, "dt ns", self.latest.get("dt_ns", 0), 20_000_000)
-        self._metric(14, 2, "sleep drift ns", self.latest.get("sleep_drift_ns", 0), 10_000_000)
-        self._metric(16, 2, "process ns estimate", self.latest.get("process_ns_estimate", 0), 10_000_000)
+        self._box(5, 0, 5, w - 1, "Timeline")
+        self._draw_event_rail(7, 2, max(10, w - 4), elapsed)
 
-        self._box(10, left_w + 1, 9, max(20, w - left_w - 1), "Phase")
-        self._draw_timeline(12, left_w + 3, max(10, w - left_w - 5), elapsed)
-        phase = self._phase(elapsed)
-        self._add(15, left_w + 3, f"Current phase: {phase}", self._color(1))
-        self._draw_event_rail(17, left_w + 3, max(10, w - left_w - 5), elapsed)
-        self._draw_detector_meter(19, left_w + 3, max(10, w - left_w - 5))
+        self._box(10, 0, 4, w - 1, "Signal Watcher")
+        self._draw_signal_watcher_summary(12, 2, max(10, w - 4))
 
-        self._box(22, 0, max(4, h - 24), w - 1, "Events")
-        visible = self.live_events[-max(1, h - 27):]
+        matrix_y = 14
+        event_h = min(8, max(4, h // 4))
+        matrix_h = max(6, h - matrix_y - event_h - 3)
+        self._box(matrix_y, 0, matrix_h, w - 1, "Channel Matrix")
+        self._draw_channel_matrix(matrix_y + 2, 2, max(1, w - 4), max(1, matrix_h - 3))
+
+        events_y = matrix_y + matrix_h
+        self._box(events_y, 0, max(4, h - events_y - 1), w - 1, "Events")
+        self._draw_live_event_list(events_y + 2, 2, max(1, w - 4), max(1, h - events_y - 4))
+        self._add(h - 2, 2, "Heuristic events are automatic | SPACE user marker | n noise | q review flag")
+        self.screen.refresh()
+
+    def _draw_live_values(self, y: int, x: int, width: int, max_rows: int) -> None:
+        values = self.latest.get("values", {})
+        values = values if isinstance(values, dict) else {}
+        preferred = ["dt_ns", "sleep_drift_ns", "process_ns_estimate"]
+        keys = [key for key in preferred if key in values]
+        keys.extend(sorted(key for key in values if key not in set(preferred)))
+        if not keys:
+            self._add(y, x, "No numeric preview values yet.")
+            return
+        for row, key in enumerate(keys[:max_rows]):
+            value = values.get(key, 0)
+            self._add(y + row, x, clip_text(f"{key:<26} {format_metric_value(value):>12}", width))
+
+    def _draw_live_channels(self, y: int, x: int, width: int, max_rows: int) -> None:
+        channels = self.latest.get("channels", [])
+        channels = channels if isinstance(channels, list) else []
+        if not channels:
+            self._add(y, x, "No channel telemetry yet.")
+            return
+        header = "ID                    bit  rate  state      value"
+        self._add(y, x, clip_text(header, width), curses.A_BOLD)
+        for offset, channel in enumerate(channels[:max(0, max_rows - 1)], start=1):
+            if not isinstance(channel, dict):
+                continue
+            state = channel_state_label(channel)
+            color = self._color(4 if state == "offline" else 3 if state == "stale" else 2)
+            value = channel.get("value")
+            line = f"{str(channel.get('id', 'unknown')):<21} {channel.get('bit', '')!s:<4} {float(channel.get('rate_hz', 0) or 0):<5.0f} {state:<10} {format_metric_value(value)}"
+            self._add(y + offset, x, clip_text(line, width), color)
+
+    def _update_channel_history(self, update: dict[str, object]) -> None:
+        values = update.get("values", {})
+        values = values if isinstance(values, dict) else {}
+        for key, value in values.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            history = self.channel_history.setdefault(str(key), deque(maxlen=64))
+            history.append(float(value))
+
+    def _baseline_profiles(self) -> dict[str, dict[str, float]]:
+        if self.baseline is not None:
+            return self.baseline.channels
+        if self.classifier is not None:
+            return self.classifier.detector_baseline
+        return {}
+
+    def _draw_signal_watcher_summary(self, y: int, x: int, width: int) -> None:
+        if not self.config.auto_detect:
+            self._add(y, x, "Auto detector off")
+            return
+        state = self.detector_state
+        color = self._color(4 if state.status == "event" else 3 if state.status == "watching" else 2)
+        line = f"score {state.score:0.1f} / {state.threshold:g}  {state.status.upper():<10} strongest: {state.channel}"
+        self._add(y, x, clip_text(line, width), color)
+
+    def _draw_channel_matrix(self, y: int, x: int, width: int, max_rows: int) -> None:
+        rows = self._channel_matrix_rows()
+        if not rows:
+            self._add(y, x, "No channel telemetry yet.")
+            return
+        header = f"{'channel':<26} {'value':>12} {'MAD/z':>7} {'state':<10} sparkline"
+        self._add(y, x, clip_text(header, width), curses.A_BOLD)
+        for offset, row in enumerate(rows[:max(0, max_rows - 1)], start=1):
+            color = self._color(4 if row["state"] == "offline" else 3 if row["state"] == "stale" else 2)
+            line = f"{row['channel']:<26} {row['value']:>12} {row['score']:>7} {row['state']:<10} {row['sparkline']}"
+            self._add(y + offset, x, clip_text(line, width), color)
+
+    def _channel_matrix_rows(self) -> list[dict[str, str]]:
+        values = self.latest.get("values", {})
+        values = values if isinstance(values, dict) else {}
+        channels = self.latest.get("channels", [])
+        channels = channels if isinstance(channels, list) else []
+        profiles = self._baseline_profiles()
+        channel_state_by_id = {str(channel.get("id", "")): channel_state_label(channel) for channel in channels if isinstance(channel, dict)}
+        rows = []
+        for name in sorted(values):
+            value = values.get(name)
+            history = list(self.channel_history.get(str(name), []))
+            score = robust_channel_score(str(name), value, profiles, history)
+            state = channel_state_by_id.get(value_channel_id(str(name)), channel_state_by_id.get(str(name), "sampled" if history else "idle"))
+            rows.append({
+                "channel": str(name),
+                "value": format_metric_value(value),
+                "score": f"{score:0.1f}",
+                "state": state,
+                "sparkline": sparkline(history, 10),
+            })
+        preferred = {"dt_ns": 0, "sleep_drift_ns": 1, "process_ns_estimate": 2}
+        return sorted(rows, key=lambda row: (preferred.get(row["channel"], 99), -float(row["score"]), row["channel"]))
+
+    def _draw_live_event_list(self, y: int, x: int, width: int, max_rows: int) -> None:
+        visible = self.live_events[-max_rows:]
         for i, event in enumerate(visible):
             source = str(event.get("source", "system"))
             color = self._color(2 if source == "system" else 5 if source == "heuristic" else 3)
+            channel = f" {event.get('channel')}" if event.get("channel") else ""
             score = f" score={event.get('score')}" if "score" in event else ""
-            self._add(24 + i, 2, f"{source:<9} {event.get('event', 'event'):<25} {event.get('t_ms', 0):>6} ms{score}", color)
-        self._add(h - 2, 2, "Heuristic events are automatic | SPACE user marker | n noise | q review flag")
-        self.screen.refresh()
+            line = f"{source:<10} {str(event.get('event', 'event')) + channel:<36} {event.get('t_ms', 0):>6} ms{score}"
+            self._add(y + i, x, clip_text(line, width), color)
 
     def _draw_event_rail(self, y: int, x: int, width: int, elapsed_ms: int) -> None:
         total = max(1, int(self.config.duration * 1000))
@@ -768,6 +1139,7 @@ class SceneRecorderTUI:
         self._add(y, x, f"Signal watcher {bar} {state.score:>4.1f}/{state.threshold:g} {state.status} {state.channel}", color)
 
     def _review(self, scene: dict[str, object]) -> str:
+        self.screen.timeout(-1)
         choices = [("keep", "Keep"), ("retake", "Retake"), ("discard", "Discard")]
         idx = 0
         while True:
@@ -790,11 +1162,27 @@ class SceneRecorderTUI:
                 return choices[idx][0]
 
     def _complete(self, results: list[dict[str, object]]) -> None:
+        self.screen.timeout(-1)
         kept = sum(1 for scene in results if scene.get("accepted"))
         self.screen.erase()
         self.scenes = load_project_scenes(self.config.project_name)
-        self.baseline = self._train_baseline()
-        self.classifier = self._train_classifier()
+        try:
+            self.intelligence_state = run_intelligence_update(
+                self.config.project_name,
+                startup=False,
+                run_watchers=False,
+                run_orbiters=False,
+                run_training=True,
+                run_transfer=False,
+            )
+            self.baseline = load_project_baseline(self.config.project_name)
+            self.classifier = self._load_classifier()
+            self.timeseries = load_project_timeseries(self.config.project_name)
+            self.evaluation_report = dict(dict(self.intelligence_state.get("models", {})).get("evaluation", {}))
+        except Exception:
+            self.baseline = self._train_baseline()
+            self.classifier = self._train_classifier()
+            self.evaluation_report = self._evaluate_project()
         self._title("Capture Complete", f"{kept}/{len(results)} accepted | {len(self.scenes)} total in {self.config.project_name}")
         for i, scene in enumerate(results[: self.screen.getmaxyx()[0] - 6]):
             status = "kept" if scene.get("accepted") else "not accepted"
@@ -804,19 +1192,107 @@ class SceneRecorderTUI:
         self.screen.getch()
 
     def _validate_project_summary(self) -> str:
-        result = validate_dataset(self.config.project_name)
+        result, summary = validate_project(self.config.project_name)
         self.last_validation_result = result
-        return f"{result.valid_scenes}/{result.total_scenes} valid, {result.error_count} errors, {result.warning_count} warnings"
+        return summary
+
+    def _evaluate_project(self) -> dict[str, object] | None:
+        try:
+            return evaluate_project_job(self.config.project_name)
+        except (OSError, ValueError):
+            return None
+
+    def _validation_summary_from_state(self, state: dict[str, object]) -> str:
+        for step in list(state.get("steps", [])):
+            row = dict(step)
+            if row.get("name") == "validate":
+                summary = dict(row.get("summary", {}))
+                return f"{summary.get('valid_scenes', 0)}/{summary.get('total_scenes', 0)} valid, {summary.get('errors', 0)} errors, {summary.get('warnings', 0)} warnings"
+        return "not run"
+
+    def _start_intelligence_job(self) -> None:
+        def job(update, cancel_event) -> str:
+            update("updating local evidence layers")
+            if cancel_event.is_set():
+                return "cancelled before start"
+            detail = update_intelligence_job(
+                self.config.project_name,
+                run_watchers=self.config.startup_watchers,
+                run_orbiters=self.config.startup_orbiters,
+                run_training=True,
+                run_transfer=True,
+            )
+            self.intelligence_state = load_intelligence_state(self.config.project_name)
+            self.baseline = load_project_baseline(self.config.project_name)
+            self.classifier = self._load_classifier()
+            self.timeseries = load_project_timeseries(self.config.project_name)
+            self.scenes = load_project_scenes(self.config.project_name)
+            if self.intelligence_state is not None:
+                self.validation_summary = self._validation_summary_from_state(self.intelligence_state)
+                self.evaluation_report = dict(dict(self.intelligence_state.get("models", {})).get("evaluation", {}))
+            return detail
+
+        self.job_manager.start("update intelligence", job)
+
+    def _start_training_jobs(self) -> None:
+        def baseline_job(update, cancel_event) -> str:
+            update("training")
+            if cancel_event.is_set():
+                return "cancelled before start"
+            self.baseline = self._train_baseline()
+            return "not enough accepted baseline scenes" if self.baseline is None else f"{self.baseline.scene_count} scenes"
+
+        def classifier_job(update, cancel_event) -> str:
+            update("training")
+            if cancel_event.is_set():
+                return "cancelled before start"
+            self.classifier = self._train_classifier()
+            self.evaluation_report = self._evaluate_project()
+            return "not enough accepted scenes" if self.classifier is None else f"{self.classifier.scene_count} scenes"
+
+        self.job_manager.start("train baseline", baseline_job)
+        self.job_manager.start("train classifier", classifier_job)
+
+    def _start_validate_job(self) -> None:
+        def job(update, cancel_event) -> str:
+            update("checking scenes")
+            if cancel_event.is_set():
+                return "cancelled before start"
+            self.validation_summary = self._validate_project_summary()
+            self.evaluation_report = self._evaluate_project()
+            return self.validation_summary
+
+        self.job_manager.start("validate dataset", job)
+
+    def _start_watcher_job(self) -> None:
+        def job(update, cancel_event) -> str:
+            update("running scan")
+            if cancel_event.is_set():
+                return "cancelled before start"
+            self.watcher_summary = self._run_watcher_summary()
+            self.scenes = load_project_scenes(self.config.project_name)
+            self.baseline = self._train_baseline()
+            self.classifier = self._train_classifier()
+            self.evaluation_report = self._evaluate_project()
+            return self.watcher_summary
+
+        self.job_manager.start("watcher scan", job)
+
+    def _start_export_job(self) -> None:
+        def job(update, cancel_event) -> str:
+            update("writing bundle")
+            if cancel_event.is_set():
+                return "cancelled before start"
+            self.transfer_summary = self._export_transfer_summary()
+            return self.transfer_summary
+
+        self.job_manager.start("export transfer", job)
 
     def _run_watcher_summary(self) -> str:
-        result = run_watcher_scan(self.config.project_name, duration=3.0, tick_hz=50)
-        detected = len(result.get("detected", []))
-        scene = dict(result.get("scene", {}))
-        return f"watcher saved {scene.get('scene_id', '?')} with {detected} auto events"
+        return run_watcher_job(self.config.project_name, self.config.channel_groups, duration=3.0, tick_hz=50)
 
     def _export_transfer_summary(self) -> str:
-        bundle = export_transfer_bundle(self.config.project_name)
-        return f"exported {bundle.get('total_scenes', 0)} scenes"
+        return export_transfer_job(self.config.project_name)
 
     def _prompt(self, title: str, default: str) -> str:
         h, w = self.screen.getmaxyx()
@@ -909,8 +1385,12 @@ class SceneRecorderTUI:
         return curses.color_pair(pair) if curses.has_colors() else 0
 
 
-def run_tui(config: CaptureConfig) -> list[dict[str, object]]:
+def run_curses_tui(config: CaptureConfig) -> list[dict[str, object]]:
     return curses.wrapper(lambda screen: SceneRecorderTUI(screen, config).run())
+
+
+def run_tui(config: CaptureConfig) -> list[dict[str, object]]:
+    return run_curses_tui(config)
 
 
 def load_project_scenes(project_name: str) -> list[dict[str, object]]:
@@ -926,114 +1406,22 @@ def load_project_scenes(project_name: str) -> list[dict[str, object]]:
     return scenes
 
 
-def summarize_scene_counts(scenes: list[dict[str, object]]) -> dict[str, int]:
-    counts = {"baseline": 0, "user": 0, "other": 0}
-    for scene in scenes:
-        label = str(scene.get("label", ""))
-        if label.startswith("baseline_"):
-            counts["baseline"] += 1
-        elif label.startswith("user_") or label.startswith("person_") or label in {"Approach", "typing_burst", "mouse_activity", "door_open_close", "phone_near_computer"}:
-            counts["user"] += 1
-        else:
-            counts["other"] += 1
-    return counts
+def _step_detail(step: dict[str, object]) -> str:
+    summary = step.get("summary", {})
+    if isinstance(summary, dict):
+        if summary.get("error"):
+            return str(summary.get("error"))
+        for key in ("path", "scene_count", "valid_scenes", "event_count", "summary_count", "total_scenes"):
+            if key in summary:
+                return f"{key}={summary.get(key)}"
+    return ""
 
 
-def wrap_text(text: str, width: int) -> list[str]:
-    cleaned = str(text or "").strip() or "(no notes)"
-    if width <= 1:
-        return [cleaned[:1] or " "]
-    lines: list[str] = []
-    for paragraph in cleaned.splitlines() or [cleaned]:
-        wrapped = textwrap.wrap(paragraph, width=width, break_long_words=True, break_on_hyphens=False) or [""]
-        lines.extend(wrapped)
-    return lines or ["(no notes)"]
-
-
-def clip_text(text: str, width: int) -> str:
-    if width <= 0:
-        return ""
-    value = str(text)
-    if len(value) <= width:
-        return value
-    if width <= 3:
-        return value[:width]
-    return value[: width - 3] + "..."
-
-
-def tab_index_delta(index: int, delta: int) -> int:
-    if not TABS:
-        return 0
-    return (index + delta) % len(TABS)
-
-
-def scene_detail_lines(scene: dict[str, object]) -> list[str]:
-    quality = scene.get("quality", {})
-    quality = quality if isinstance(quality, dict) else {}
-    return [
-        f"Scene ID: {scene.get('scene_id', '?')}",
-        f"Label: {scene.get('label', '?')}",
-        f"Created: {scene.get('created_utc', '?')}",
-        f"Duration: {scene.get('duration_ms', '?')} ms | tick {scene.get('tick_hz', '?')} Hz",
-        f"Window: pre {scene.get('pre_roll_ms', '?')} ms | action {scene.get('action_start_ms', '?')}-{scene.get('action_end_ms', '?')} ms | post {scene.get('post_roll_ms', '?')} ms",
-        f"Accepted: {scene.get('accepted', False)} | events {scene.get('user_event_count', 0)}",
-        f"Quality: confidence {quality.get('confidence', '?')} | frames {quality.get('actual_frames', '?')}/{quality.get('expected_frames', '?')}",
-        f"Checksum: {quality.get('checksum_ok', '?')} | frame size {quality.get('frame_size_valid', '?')}",
-        f"Availability mask: {quality.get('channel_availability_mask', '?')}",
-    ]
-
-
-def profile_line(channel: str, profile: dict[str, float]) -> str:
-    return (
-        f"{channel:<30} "
-        f"{float(profile.get('center', 0.0)):>12.3g} "
-        f"{float(profile.get('mad', 0.0)):>12.3g} "
-        f"{float(profile.get('p95', 0.0)):>12.3g} "
-        f"{float(profile.get('p99', 0.0)):>12.3g}"
-    )
-
-
-def classifier_summary_lines(model: SceneClassifierModel | None, auto_detect: bool) -> list[str]:
-    if model is None:
-        return [
-            "No classifier trained yet",
-            "Accepted scenes will train it",
-            "Press t to retry training",
-        ]
-
-    label_count = len(model.label_counts)
-    channels = ", ".join(sorted(model.detector_baseline)) or "none"
-    auto_text = "using learned baseline" if auto_detect and model.detector_baseline else "not used by auto events"
-    top_labels = sorted(model.label_counts.items(), key=lambda item: (-item[1], item[0]))[:3]
-    label_text = ", ".join(f"{label}:{count}" for label, count in top_labels) or "none"
-    trained = model.trained_utc.replace("T", " ").replace("Z", " UTC")
-    if "." in trained:
-        trained = trained.split(".", 1)[0] + " UTC"
-    return [
-        "Active",
-        f"trained scenes {model.scene_count} | baseline {model.baseline_scene_count}",
-        f"labels {label_count} | {auto_text}",
-        f"channels {channels}",
-        f"top {label_text}",
-        f"trained {trained}",
-    ]
-
-
-def scheduled_scene_events(duration: float, pre_roll: float, action: float, post_roll: float) -> list[dict[str, object]]:
-    action_start_ms = int(pre_roll * 1000)
-    action_end_ms = int((pre_roll + action) * 1000)
-    return [
-        {"t_ms": 0, "event": "scene_start", "source": "system"},
-        {"t_ms": action_start_ms, "event": "action_start", "source": "system"},
-        {"t_ms": action_end_ms, "event": "action_end", "source": "system"},
-        {"t_ms": int(duration * 1000), "event": "scene_end", "source": "system"},
-    ]
-
-
-def system_event_marker(event_name: str) -> str:
+def _ui_status(status: str) -> str:
     return {
-        "scene_start": "S",
-        "action_start": "A",
-        "action_end": "E",
-        "scene_end": "X",
-    }.get(event_name, "?")
+        "running": "active",
+        "ok": "done",
+        "warning": "warn",
+        "failed": "warn",
+        "skipped": "skipped",
+    }.get(status, status)

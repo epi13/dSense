@@ -76,6 +76,9 @@ python -m dsense scene demo_lab --label person_walks_front_left_to_right --durat
 python -m dsense scene demo_lab --label linux_activity --duration 5 --channels portable,linux --yes
 python -m dsense train-baseline
 python -m dsense train-classifier
+python -m dsense train-timeseries
+python -m dsense update-intelligence base
+python -m dsense council-status base
 python -m dsense extract-features base
 python -m dsense rank-channels base
 python -m dsense evaluate-scenes
@@ -143,6 +146,8 @@ python -m dsense init base
 python -m dsense baseline-suite base --target-scenes 200 --yes
 python -m dsense train-baseline base
 python -m dsense train-classifier base
+python -m dsense train-timeseries base
+python -m dsense update-intelligence base
 python -m dsense validate base --verbose
 python -m dsense evaluate-scenes base
 python -m dsense tui base
@@ -158,11 +163,16 @@ Use `python -m dsense` or `python -m dsense tui` for the full-screen recorder. B
 
 The TUI is Linux/Unix-first because it depends on terminal curses behavior. Non-TUI commands such as `doctor`, `scan`, `init`, `record-baseline`, `scene`, `validate`, and export commands are intended to remain portable where the underlying channel adapters are available.
 
-When the TUI opens on Linux/Fedora, dSense records a short local startup baseline scene labeled `baseline_startup_auto`, trains `exports/baseline_model.json`, and then opens the interface. This means the scene count should increase by one each time the TUI starts unless startup baseline capture is disabled. On non-Linux systems the default policy is `missing-only`, so dSense records this startup baseline only when no usable baseline model exists. dSense tries portable plus readable Linux channels for startup baselines; unavailable channels are skipped without privileged requirements.
+When the TUI opens normally, dSense shows a startup/update pipeline and refreshes the local intelligence stack before opening the main dashboard. The update coordinates dataset validation, baseline training, deterministic classifier training, the time-series model, evaluation, watcher state, orbiter summaries, transfer status, and the shared Council artifact at `datasets/<project>/exports/intelligence_state.json`. Failures in one layer are shown as warnings or failed steps so the project can still open when possible.
 
-The TUI also fills the automatic system baseline/control suite before opening. By default it targets 200 `baseline_suite` scenes on Linux, so a new or shallow project will add many automatic idle/timing/CPU/memory/disk/proc/combined/drift control captures before the interface appears. If the project already has enough suite scenes, dSense reuses them instead of creating duplicates.
+To open the TUI without startup training, watcher scans, orbiters, or baseline-suite work:
 
-Startup baseline controls:
+```bash
+dsense tui base --no-startup-intelligence
+dsense tui-safe base
+```
+
+Granular startup controls:
 
 ```bash
 dsense tui base --no-auto-baseline
@@ -172,20 +182,32 @@ dsense tui base --auto-baseline-policy startup
 dsense tui base --force-auto-baseline
 dsense tui base --auto-baseline-duration 10
 dsense tui base --no-startup-suite
+dsense tui base --no-startup-watchers
+dsense tui base --no-startup-orbiters
+dsense tui base --no-startup-training
 dsense tui base --startup-suite-target 200
 dsense tui base --startup-suite-duration 0.2
 ```
 
-The TUI opens as a tabbed local control panel. The tab bar includes `Record`, `Scenes`, `Channels`, `Learn`, `Classify`, `Watcher`, `Orbiters`, `Transfer`, `Validate`, and `Help`. The `Record` tab keeps the editable capture setup with preset groups for `user`, `baseline`, and `activity` scenes. `Scenes` lets you browse recorded scenes and inspect wrapped scene notes. `Channels` shows adapter status. `Learn` and `Classify` show local model state. `Watcher`, `Orbiters`, `Transfer`, and `Validate` expose the project tools without leaving the terminal.
+The TUI opens as a tabbed local control panel. The tab bar includes `Record`, `Scenes`, `Channels`, `Council`, `Learn`, `Classify`, `Evaluation`, `Watcher`, `Orbiters`, `Transfer`, `Validate`, and `Help`. The `Record` tab keeps the editable capture setup with preset groups for `user`, `baseline`, and `activity` scenes. `Scenes` lets you browse recorded scenes and inspect wrapped scene notes. `Channels` shows adapter status. `Council` shows coordinated local evidence, model agreement, confidence, warnings, and recommendations. `Learn` and `Classify` show local model state. `Watcher`, `Orbiters`, `Transfer`, and `Validate` expose project artifacts without leaving the terminal.
 
-It trains or refreshes local baseline/classifier models from accepted scenes, then records with a live overview of frame progress, current phase, timing drift, process estimate, and marker count.
+Press `u` from the TUI setup screen to run **Update Intelligence** again. This is the primary manual update path and refreshes validation, baseline, classifier, time-series, evaluation, watcher/orbiter context, transfer, and Council state. Focused commands such as validation and export remain available, but the main workflow is one comprehensive local update rather than separate model operations.
 
-The baseline model is stored at `datasets/<project_name>/exports/baseline_model.json`. The classifier is stored at `datasets/<project_name>/exports/classifier.json`. They use accepted scene previews to build baseline channel profiles and label summaries. They are retrained automatically when the TUI opens and after new accepted recordings are added, so automatic event detection improves as the project grows. You can retrain them explicitly with:
+The baseline model is stored at `datasets/<project_name>/exports/baseline_model.json`. The classifier is stored at `datasets/<project_name>/exports/classifier.json`. The time-series model is stored at `datasets/<project_name>/exports/timeseries_model.json`. These use accepted scene previews to build baseline channel profiles, label summaries, and temporal profiles. You can refresh them explicitly with:
 
 ```bash
 python -m dsense train-baseline --require-valid
 python -m dsense train-classifier --require-valid
+python -m dsense train-timeseries --require-valid
+python -m dsense update-intelligence base
+python -m dsense council-status base
 ```
+
+### Intelligence Council and time-series model
+
+The Intelligence Council is a coordination/reporting layer, not a claim of awareness. It combines coordinated local evidence layers: baseline readiness, deterministic classifier labels, time-series profile agreement, watcher events, orbiter summary availability, evaluation quality, baseline drift, useful channels, and transfer status. It writes inspectable JSON to `exports/intelligence_state.json` with confidence, warnings, recommendations, best channels, weak labels, and per-step status.
+
+The time-series model is dependency-light and standard-library based. It reads accepted `preview.csv` files, discovers numeric channels dynamically, extracts temporal features such as first/last value, slope, peak count, roughness, rolling variance, max absolute delta, and window medians, then predicts by normalized distance to per-label profiles. It is additive and does not replace the deterministic classifier.
 
 ## Phase 7 evaluation
 
@@ -227,9 +249,8 @@ On the setup screen:
 - `p` / `o` cycles presets inside the current mode
 - `g` toggles batch recording for the whole current preset group
 - `a` toggles automatic heuristic event detection
-- `t` retrains baseline and classifier models from accepted project scenes
+- `u` updates the full local intelligence stack
 - `v` validates the project and summarizes health
-- `w` runs a local watcher scan and writes watcher/orbiter artifacts
 - `e` exports a local transfer bundle
 - `Enter` edits the selected field or cycles mode/preset/toggle fields
 - `c` starts recording from the `Record` tab

@@ -22,8 +22,14 @@ from .utils.files import ensure_dir, read_json, write_json
 from .utils.timebase import monotonic_ns, utc_now_iso
 
 
-def run_watcher_scan(project_name: str, duration: float = 5.0, tick_hz: int = 50) -> dict[str, object]:
+def run_watcher_scan(
+    project_name: str,
+    duration: float = 5.0,
+    tick_hz: int = 50,
+    channel_groups: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, object]:
     validate_capture_params(duration, tick_hz)
+    selected_groups = list(channel_groups or ("portable",))
     root = project_path(project_name)
     baseline = load_project_baseline(project_name) or train_and_save_project_baseline(project_name)
     classifier = load_project_classifier(project_name) or train_and_save_project_classifier(project_name)
@@ -53,6 +59,7 @@ def run_watcher_scan(project_name: str, duration: float = 5.0, tick_hz: int = 50
         notes="TUI watcher scan",
         mode="watcher",
         progress_callback=progress,
+        channel_groups=selected_groups,
     )
     if not detected:
         scene["label"] = "watcher_scan"
@@ -74,6 +81,7 @@ def run_watcher_scan(project_name: str, duration: float = 5.0, tick_hz: int = 50
         "strongest_channel": baseline_status.get("channel", "none"),
         "classifier_prediction": prediction,
         "detected_events": detected,
+        "channel_groups": selected_groups,
     }
     watcher_events_path = append_watcher_event(root, event)
     summary = make_orbiter_summary(
@@ -103,10 +111,12 @@ def run_rolling_watcher(
     duration: float = 0.0,
     sample_rows: Iterable[dict[str, object]] | None = None,
     prompt_label: bool = False,
+    channel_groups: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, object]:
     validate_capture_params(max(duration, 0.01) if duration else 0.01, tick_hz)
     if pre_seconds < 0 or post_seconds < 0 or cooldown_seconds < 0:
         raise ValueError("pre_seconds, post_seconds, and cooldown_seconds must be >= 0")
+    selected_groups = list(channel_groups or ("portable",))
     root = project_path(project_name)
     baseline = load_project_baseline(project_name) or train_and_save_project_baseline(project_name)
     classifier = load_project_classifier(project_name) or train_and_save_project_classifier(project_name)
@@ -125,12 +135,13 @@ def run_rolling_watcher(
         "post_seconds": post_seconds,
         "tick_hz": tick_hz,
         "cooldown_seconds": cooldown_seconds,
+        "channel_groups": selected_groups,
         "windows": [],
     }
     cooldown_until_tick = -1
     max_ticks = int(round(duration * tick_hz)) if duration > 0 else None
 
-    samples = sample_rows if sample_rows is not None else _live_samples(tick_hz, interval_ns)
+    samples = sample_rows if sample_rows is not None else _live_samples(tick_hz, interval_ns, selected_groups)
     iterator = iter(samples)
     tick = 0
     while max_ticks is None or tick < max_ticks:
@@ -169,6 +180,7 @@ def run_rolling_watcher(
                 post_seconds,
                 events,
                 accepted=label != "watcher_anomaly_candidate",
+                channel_groups=selected_groups,
             )
             prediction = predict_scene(classifier, scene_dir / "preview.csv")
             baseline_status = score_against_baseline(_core_values(captured[-1] if captured else sample), baseline)
@@ -183,6 +195,7 @@ def run_rolling_watcher(
                 "detected_events": events,
                 "pre_seconds": pre_seconds,
                 "post_seconds": post_seconds,
+                "channel_groups": selected_groups,
             }
             watcher_events_path = append_watcher_event(root, event)
             session["windows"].append(event)
@@ -250,8 +263,12 @@ def read_recent_watcher_events(project_name: str, limit: int = 5) -> list[dict[s
     return rows[-limit:]
 
 
-def _live_samples(tick_hz: int, interval_ns: int) -> Iterable[dict[str, object]]:
-    channels = _prepare_channel_runtimes(default_channels(), tick_hz)
+def _live_samples(
+    tick_hz: int,
+    interval_ns: int,
+    channel_groups: list[str] | tuple[str, ...] | None = None,
+) -> Iterable[dict[str, object]]:
+    channels = _prepare_channel_runtimes(default_channels(channel_groups), tick_hz)
     start_ns = monotonic_ns()
     tick = 0
     try:
@@ -291,7 +308,7 @@ def _normalize_sample(sample: dict[str, object], tick: int, interval_ns: int) ->
 
 def _progress_from_sample(sample: dict[str, object], tick_hz: int) -> dict[str, object]:
     tick = int(sample.get("tick", 0) or 0)
-    return {
+    progress = {
         "tick": tick,
         "elapsed_ms": int(tick * 1000 / max(tick_hz, 1)),
         "dt_ns": sample.get("dt_ns", 0),
@@ -300,6 +317,14 @@ def _progress_from_sample(sample: dict[str, object], tick_hz: int) -> dict[str, 
         "availability_mask": sample.get("availability_mask", 0),
         "quality_flags": sample.get("quality_flags", 0),
     }
+    values = {
+        key: value
+        for key, value in sample.items()
+        if key not in progress and isinstance(value, (int, float)) and not isinstance(value, bool)
+    }
+    progress["values"] = values
+    progress.update(values)
+    return progress
 
 
 def _write_rolling_scene(
@@ -312,6 +337,7 @@ def _write_rolling_scene(
     post_seconds: float,
     detected_events: list[dict[str, object]],
     accepted: bool,
+    channel_groups: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, object]:
     ensure_dir(scene_dir)
     duration_ms = int(len(samples) * 1000 / max(tick_hz, 1))
@@ -361,6 +387,7 @@ def _write_rolling_scene(
         "action_start_ms": int(pre_seconds * 1000),
         "action_end_ms": min(duration_ms, int((pre_seconds + post_seconds) * 1000)),
         "post_roll_ms": int(post_seconds * 1000),
+        "channel_groups": list(channel_groups or ("portable",)),
         "quality": quality,
         "accepted": accepted,
         "notes": "Rolling watcher anomaly window",

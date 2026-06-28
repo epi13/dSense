@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import argparse, csv, json, sys
 from pathlib import Path
-from .baseline import default_auto_baseline_policy, ensure_startup_baseline, train_and_save_project_baseline
-from .baseline_suite import baseline_suite_report_path, ensure_startup_baseline_suite, run_baseline_suite
+from .baseline import train_and_save_project_baseline
+from .baseline_suite import baseline_suite_report_path, run_baseline_suite
 from .channels import parse_channel_groups
 from .classifier import train_and_save_project_classifier
+from .council import intelligence_state_path, load_intelligence_state, run_intelligence_update
 from .doctor import doctor_ok, print_doctor_report, run_doctor
 from .gemma_edge import gemma_edge_status
 from .inputs import validate_capture_params, validate_duration_windows
@@ -30,6 +31,7 @@ from .workloads import valid_workload_ids, workload_progress_callback
 from .utils.files import read_json, write_json
 from .autotest import validate_dataset, print_validation_report
 from .transfer import compare_transfer_bundle, export_transfer_bundle, transfer_bundle_path
+from .timeseries import timeseries_path, train_and_save_project_timeseries
 from .watcher import label_candidate, run_rolling_watcher, run_watcher_scan
 
 
@@ -197,7 +199,7 @@ def _validate_repeat_tick(repeat: int, tick_hz: int) -> None:
 
 def _run_tui_config(**kwargs) -> list[dict[str, object]]:
     try:
-        from .tui import CaptureConfig, run_tui
+        from .tui_app import CaptureConfig, run_tui
     except Exception as exc:
         raise SystemExit(f"TUI unavailable: {exc}. Non-TUI commands like doctor, scan, init, scene, and validate are still available.") from None
     try:
@@ -234,6 +236,7 @@ def cmd_scene(args):
     if args.tui:
         _run_tui_config(
             project_name=args.project_name,
+            channel_groups=groups,
             label=args.label,
             duration=duration,
             pre_roll=args.pre_roll,
@@ -242,6 +245,8 @@ def cmd_scene(args):
             repeat=args.repeat,
             tick_hz=args.tick_hz,
             notes=args.notes,
+            auto_baseline_policy="off",
+            startup_suite_enabled=False,
         )
         return
     guided_scene(args.project_name, args.label, duration, args.pre_roll, args.action, args.post_roll, args.repeat, args.notes, args.tick_hz, args.yes, channel_groups=groups)
@@ -249,47 +254,24 @@ def cmd_scene(args):
 
 def cmd_tui(args):
     project_name = args.project_name or DEFAULT_PROJECT
+    groups = parse_channel_groups(args.channels)
     print("Opening dSense...")
     print(f"Project: {project_name}")
     policy = "off" if args.no_auto_baseline else args.auto_baseline_policy
-    resolved_policy = default_auto_baseline_policy() if policy == "auto" else policy
-    print(f"Checking system baseline... policy={resolved_policy}")
-    status = ensure_startup_baseline(
-        project_name,
-        duration=args.auto_baseline_duration,
-        tick_hz=args.tick_hz,
-        policy=policy,
-        force=args.force_auto_baseline,
-    )
-    startup_baseline_status = str(status.get("message", "Startup baseline status unknown"))
-    print(startup_baseline_status)
-    if status.get("status") == "recorded":
-        print("Training baseline model...")
-        print("Baseline ready.")
-    elif status.get("status") == "failed":
-        print("Continuing without startup baseline.")
-    startup_suite_status = "Startup system suite: skipped"
-    if args.no_startup_suite:
-        startup_suite_status = "Startup system suite: skipped by --no-startup-suite"
-        print(startup_suite_status)
-    else:
-        print(f"Checking startup system suite... target={args.startup_suite_target}")
-        suite_status = ensure_startup_baseline_suite(
-            project_name,
-            target_scenes=args.startup_suite_target,
-            duration=args.startup_suite_duration,
-            tick_hz=args.tick_hz,
-            linux=args.startup_suite_linux,
-            seed=args.startup_suite_seed,
-            enabled=True,
-        )
-        startup_suite_status = str(suite_status.get("message", "Startup system suite status unknown"))
-        print(startup_suite_status)
-    print("Opening TUI...")
+    startup_intelligence = not args.no_startup_intelligence
+    if not startup_intelligence:
+        policy = "off"
+        args.no_startup_suite = True
+        args.no_startup_watchers = True
+        args.no_startup_orbiters = True
+        args.no_startup_training = True
+        print("Startup intelligence disabled for this session.")
+    print("Opening TUI startup pipeline..." if startup_intelligence else "Opening TUI without startup intelligence...")
     duration = _validated_duration(args.duration, args.pre_roll, args.action, args.post_roll)
     _validate_repeat_tick(args.repeat, args.tick_hz)
     _run_tui_config(
         project_name=project_name,
+        channel_groups=groups,
         label=args.label,
         duration=duration,
         pre_roll=args.pre_roll,
@@ -298,8 +280,29 @@ def cmd_tui(args):
         repeat=args.repeat,
         tick_hz=args.tick_hz,
         notes=args.notes,
-        startup_baseline_status=f"{startup_baseline_status} | {startup_suite_status}",
+        auto_baseline_policy=policy,
+        auto_baseline_duration=args.auto_baseline_duration,
+        force_auto_baseline=args.force_auto_baseline,
+        startup_suite_enabled=not args.no_startup_suite,
+        startup_suite_target=args.startup_suite_target,
+        startup_suite_duration=args.startup_suite_duration,
+        startup_suite_seed=args.startup_suite_seed,
+        startup_suite_linux=args.startup_suite_linux,
+        startup_intelligence=startup_intelligence,
+        startup_watchers=not args.no_startup_watchers,
+        startup_orbiters=not args.no_startup_orbiters,
+        startup_training=not args.no_startup_training,
     )
+
+
+def cmd_tui_safe(args):
+    args.no_startup_intelligence = True
+    args.no_startup_watchers = True
+    args.no_startup_orbiters = True
+    args.no_startup_training = True
+    args.no_auto_baseline = True
+    args.no_startup_suite = True
+    cmd_tui(args)
 
 
 def cmd_list(args):
@@ -367,6 +370,73 @@ def cmd_train_baseline(args):
     print(f"  model channels: {len(model.channels)} channels, {manifest.get('feature_count', 0)} features", flush=True)
     print(f"Trained baseline for {project_name}: {model.scene_count} baseline scenes, {len(model.channels)} channels")
     print(project_path(project_name) / "exports" / "baseline_model.json")
+
+
+def cmd_train_timeseries(args):
+    project_name = args.project_name or DEFAULT_PROJECT
+    init_project(project_name)
+    stats = _project_scene_stats(project_name)
+    print(f"Training time-series model: {project_name}", flush=True)
+    print(f"  scenes discovered: {stats['total']} total, {stats['accepted']} accepted, {stats['baseline']} baseline labels", flush=True)
+    _require_valid_dataset(project_name, args.require_valid)
+    print("  extracting temporal preview features and label profiles...", flush=True)
+    model = train_and_save_project_timeseries(project_name)
+    manifest = dict(model.feature_manifest)
+    print(f"  model labels: {len(model.label_counts)} labels, {manifest.get('feature_count', 0)} features", flush=True)
+    print(f"Trained time-series model for {project_name}: {model.scene_count} scenes, {len(model.sequence_channels)} sequence channels")
+    print(timeseries_path(project_name))
+
+
+def cmd_update_intelligence(args):
+    project_name = args.project_name or DEFAULT_PROJECT
+    init_project(project_name)
+    print(f"Updating local intelligence stack: {project_name}", flush=True)
+
+    def progress(update: dict[str, object]) -> None:
+        step = dict(update.get("step", {}))
+        status = str(step.get("status", ""))
+        name = str(step.get("name", ""))
+        summary = dict(step.get("summary", {})) if isinstance(step.get("summary"), dict) else {}
+        detail = summary.get("error") or summary.get("path") or summary.get("scene_count") or ""
+        print(f"  {name}: {status}{f' ({detail})' if detail != '' else ''}", flush=True)
+
+    state = run_intelligence_update(
+        project_name,
+        startup=False,
+        run_watchers=not args.no_watchers,
+        run_orbiters=not args.no_orbiters,
+        run_training=not args.no_training,
+        run_transfer=not args.no_transfer,
+        progress_callback=progress,
+    )
+    council = dict(state.get("council", {}))
+    print(f"Status: {state.get('status')}")
+    print(f"Agreement: {council.get('agreement')}  confidence={council.get('overall_confidence')}")
+    print(intelligence_state_path(project_name))
+
+
+def cmd_council_status(args):
+    project_name = args.project_name or DEFAULT_PROJECT
+    state = load_intelligence_state(project_name)
+    if state is None:
+        raise SystemExit(f"No intelligence state found. Run: python -m dsense update-intelligence {project_name}")
+    council = dict(state.get("council", {}))
+    models = dict(state.get("models", {}))
+    print(f"Intelligence Council: {project_name}")
+    print(f"Status: {state.get('status')}  Agreement: {council.get('agreement')}  Confidence: {council.get('overall_confidence')}")
+    for name in ("baseline", "classifier", "timeseries", "watcher", "orbiters", "evaluation", "transfer"):
+        print(f"{name}: {models.get(name, {})}")
+    warnings = list(council.get("warnings", []))
+    recommendations = list(council.get("recommendations", []))
+    if warnings:
+        print("Warnings:")
+        for item in warnings:
+            print(f"  - {item}")
+    if recommendations:
+        print("Recommendations:")
+        for item in recommendations:
+            print(f"  - {item}")
+    print(intelligence_state_path(project_name))
 
 
 def cmd_export_transfer(args):
@@ -516,8 +586,9 @@ def cmd_watcher(args):
     project_name = args.project_name or DEFAULT_PROJECT
     init_project(project_name)
     validate_capture_params(max(args.duration, 0.01) if args.duration else 0.01, args.tick_hz)
+    groups = parse_channel_groups(args.channels)
     if args.rolling:
-        print(f"Starting rolling watcher: project={project_name} tick_hz={args.tick_hz} pre={args.pre}s post={args.post}s duration={args.duration or 'continuous'}", flush=True)
+        print(f"Starting rolling watcher: project={project_name} tick_hz={args.tick_hz} channels={','.join(groups)} pre={args.pre}s post={args.post}s duration={args.duration or 'continuous'}", flush=True)
         result = run_rolling_watcher(
             project_name,
             pre_seconds=args.pre,
@@ -525,6 +596,7 @@ def cmd_watcher(args):
             tick_hz=args.tick_hz,
             cooldown_seconds=args.cooldown,
             duration=args.duration,
+            channel_groups=groups,
             prompt_label=args.prompt_label,
         )
         print(f"Rolling watcher saved {len(result['saved'])} anomaly windows")
@@ -534,8 +606,8 @@ def cmd_watcher(args):
             event = dict(saved["event"])
             print(f"{scene.get('scene_id')} score={event.get('anomaly_score')} label={scene.get('label')} accepted={scene.get('accepted')}")
         return
-    print(f"Starting watcher scan: project={project_name} duration={args.duration or 5.0}s tick_hz={args.tick_hz}", flush=True)
-    result = run_watcher_scan(project_name, duration=args.duration or 5.0, tick_hz=args.tick_hz)
+    print(f"Starting watcher scan: project={project_name} duration={args.duration or 5.0}s tick_hz={args.tick_hz} channels={','.join(groups)}", flush=True)
+    result = run_watcher_scan(project_name, duration=args.duration or 5.0, tick_hz=args.tick_hz, channel_groups=groups)
     scene = dict(result["scene"])
     print(f"Watcher scan saved {scene.get('scene_id')} label={scene.get('label')} accepted={scene.get('accepted')}")
     print(result["watcher_events_path"])
@@ -580,6 +652,32 @@ def _resolve_scene_args(target: str, scene_id: str | None, project: str | None =
     return project_name, scene_dir
 
 
+def _add_tui_args(sp):
+    sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to open (default: {DEFAULT_PROJECT})")
+    sp.add_argument("--label", default="user_interaction")
+    sp.add_argument("--duration", type=float)
+    sp.add_argument("--pre-roll", type=float, default=2)
+    sp.add_argument("--action", type=float, default=5)
+    sp.add_argument("--post-roll", type=float, default=3)
+    sp.add_argument("--repeat", type=int, default=1)
+    sp.add_argument("--notes", default="")
+    sp.add_argument("--tick-hz", type=int, default=100)
+    sp.add_argument("--channels", default="portable", help="channel groups, e.g. portable or portable,linux")
+    sp.add_argument("--auto-baseline-policy", choices=["auto", "startup", "missing-only", "off"], default="auto", help="startup baseline policy; disabled by --no-startup-intelligence and tui-safe")
+    sp.add_argument("--no-auto-baseline", action="store_true", help="same as --auto-baseline-policy off")
+    sp.add_argument("--auto-baseline-duration", type=float, default=5.0, help="seconds for automatic startup baseline capture")
+    sp.add_argument("--force-auto-baseline", action="store_true", help="record a fresh startup baseline unless policy is off")
+    sp.add_argument("--no-startup-suite", action="store_true", help="skip filling the automatic system baseline/control suite on TUI startup")
+    sp.add_argument("--startup-suite-target", type=int, default=200, help="target number of baseline-suite scenes to maintain before opening TUI")
+    sp.add_argument("--startup-suite-duration", type=float, default=0.2, help="seconds per automatic startup-suite scene")
+    sp.add_argument("--startup-suite-seed", type=int, default=42)
+    sp.add_argument("--startup-suite-linux", action=argparse.BooleanOptionalAction, default=True, help="include Linux-safe startup-suite controls")
+    sp.add_argument("--no-startup-intelligence", action="store_true", help="open without automatic intelligence update, watcher scan, orbiter run, training, or startup suite")
+    sp.add_argument("--no-startup-watchers", action="store_true", help="skip startup watcher scan inside the intelligence update")
+    sp.add_argument("--no-startup-orbiters", action="store_true", help="skip startup orbiter evaluation inside the intelligence update")
+    sp.add_argument("--no-startup-training", action="store_true", help="load existing models instead of retraining during startup intelligence")
+
+
 def build_parser():
     p = argparse.ArgumentParser(prog="dsense", description="dSense Scene Wizard")
     sub = p.add_subparsers(required=True)
@@ -614,13 +712,17 @@ def build_parser():
     sp.add_argument("--include-heavy", action="store_true", help="include heavier opt-in workloads")
     sp.set_defaults(func=cmd_baseline_suite)
     sp = sub.add_parser("scene"); sp.add_argument("project_name"); sp.add_argument("--label", required=True); sp.add_argument("--duration", type=float); sp.add_argument("--pre-roll", type=float, default=2); sp.add_argument("--action", type=float, default=5); sp.add_argument("--post-roll", type=float, default=3); sp.add_argument("--repeat", type=int, default=1); sp.add_argument("--notes", default=""); sp.add_argument("--tick-hz", type=int, default=100); sp.add_argument("--channels", default="portable", help="channel groups, e.g. portable or portable,linux"); sp.add_argument("--yes", action="store_true", help="accept captures without prompt"); sp.add_argument("--tui", action="store_true", help="record with the full-screen interaction recorder"); sp.set_defaults(func=cmd_scene)
-    sp = sub.add_parser("tui"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to open (default: {DEFAULT_PROJECT})"); sp.add_argument("--label", default="user_interaction"); sp.add_argument("--duration", type=float); sp.add_argument("--pre-roll", type=float, default=2); sp.add_argument("--action", type=float, default=5); sp.add_argument("--post-roll", type=float, default=3); sp.add_argument("--repeat", type=int, default=1); sp.add_argument("--notes", default=""); sp.add_argument("--tick-hz", type=int, default=100); sp.add_argument("--auto-baseline-policy", choices=["auto", "startup", "missing-only", "off"], default="auto", help="startup baseline policy; auto uses startup on Linux and missing-only elsewhere"); sp.add_argument("--no-auto-baseline", action="store_true", help="same as --auto-baseline-policy off"); sp.add_argument("--auto-baseline-duration", type=float, default=5.0, help="seconds for automatic startup baseline capture"); sp.add_argument("--force-auto-baseline", action="store_true", help="record a fresh startup baseline unless policy is off"); sp.add_argument("--no-startup-suite", action="store_true", help="skip filling the automatic system baseline/control suite on TUI startup"); sp.add_argument("--startup-suite-target", type=int, default=200, help="target number of baseline-suite scenes to maintain before opening TUI"); sp.add_argument("--startup-suite-duration", type=float, default=0.2, help="seconds per automatic startup-suite scene"); sp.add_argument("--startup-suite-seed", type=int, default=42); sp.add_argument("--startup-suite-linux", action=argparse.BooleanOptionalAction, default=True, help="include Linux-safe startup-suite controls"); sp.set_defaults(func=cmd_tui)
+    sp = sub.add_parser("tui"); _add_tui_args(sp); sp.set_defaults(func=cmd_tui)
+    sp = sub.add_parser("tui-safe", help="open the TUI without startup intelligence, watchers, orbiters, training, or baseline-suite work"); _add_tui_args(sp); sp.set_defaults(func=cmd_tui_safe)
     sp = sub.add_parser("list-scenes"); sp.add_argument("project_name"); sp.set_defaults(func=cmd_list)
     sp = sub.add_parser("export-preview"); sp.add_argument("project_name"); sp.set_defaults(func=cmd_export)
     sp = sub.add_parser("validate"); sp.add_argument("project_name"); sp.add_argument("--verbose", "-v", action="store_true", help="show detailed error messages"); sp.set_defaults(func=cmd_validate)
     sp = sub.add_parser("train-baseline"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to train (default: {DEFAULT_PROJECT})"); sp.set_defaults(func=cmd_train_baseline)
     sp.add_argument("--require-valid", action="store_true", help="fail before training if dataset validation has errors")
     sp = sub.add_parser("train-classifier"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to train (default: {DEFAULT_PROJECT})"); sp.add_argument("--require-valid", action="store_true", help="fail before training if dataset validation has errors"); sp.set_defaults(func=cmd_train_classifier)
+    sp = sub.add_parser("train-timeseries"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to train (default: {DEFAULT_PROJECT})"); sp.add_argument("--require-valid", action="store_true", help="fail before training if dataset validation has errors"); sp.set_defaults(func=cmd_train_timeseries)
+    sp = sub.add_parser("update-intelligence"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to update (default: {DEFAULT_PROJECT})"); sp.add_argument("--no-watchers", action="store_true", help="skip watcher scan and use existing watcher events"); sp.add_argument("--no-orbiters", action="store_true", help="skip orbiter evaluation and use existing summaries"); sp.add_argument("--no-training", action="store_true", help="load existing models instead of retraining"); sp.add_argument("--no-transfer", action="store_true", help="skip transfer bundle export"); sp.set_defaults(func=cmd_update_intelligence)
+    sp = sub.add_parser("council-status"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to inspect (default: {DEFAULT_PROJECT})"); sp.set_defaults(func=cmd_council_status)
     sp = sub.add_parser("export-transfer"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to export (default: {DEFAULT_PROJECT})"); sp.add_argument("--require-valid", action="store_true", help="fail before export if dataset validation has errors"); sp.add_argument("--redact", action="store_true", help="write a privacy-redacted safe transfer bundle"); sp.set_defaults(func=cmd_export_transfer)
     sp = sub.add_parser("privacy-report"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to inspect (default: {DEFAULT_PROJECT})"); sp.add_argument("--out", help="write privacy report JSON to this path"); sp.set_defaults(func=cmd_privacy_report)
     sp = sub.add_parser("evaluate-scenes"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to evaluate (default: {DEFAULT_PROJECT})"); sp.add_argument("--out", help="write report JSON to this path"); sp.set_defaults(func=cmd_evaluate_scenes)
@@ -635,7 +737,7 @@ def build_parser():
     sp = sub.add_parser("export-trace"); sp.add_argument("target", help="project name or scene directory"); sp.add_argument("scene_id", nargs="?", help="scene id when target is a project"); sp.add_argument("--project", default=DEFAULT_PROJECT, help=f"project for direct scene paths (default: {DEFAULT_PROJECT})"); sp.add_argument("--out", help="write trace JSON to this path"); sp.set_defaults(func=cmd_export_trace)
     sp = sub.add_parser("view-scene"); sp.add_argument("target", help="project name or scene directory"); sp.add_argument("scene_id", nargs="?", help="scene id when target is a project"); sp.add_argument("--project", default=DEFAULT_PROJECT, help=f"project for direct scene paths (default: {DEFAULT_PROJECT})"); sp.add_argument("--out", help="write viewer HTML to this path"); sp.add_argument("--no-open", action="store_true", help="write the viewer without opening a browser"); sp.set_defaults(func=cmd_view_scene)
     sp = sub.add_parser("compare-transfer"); sp.add_argument("project_or_bundle", help="project name or transfer bundle JSON path"); sp.add_argument("bundle", nargs="?", help="transfer bundle JSON path"); sp.set_defaults(func=cmd_compare_transfer)
-    sp = sub.add_parser("watcher"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to watch (default: {DEFAULT_PROJECT})"); sp.add_argument("--rolling", action="store_true", help="use rolling anomaly windows instead of scan recording"); sp.add_argument("--pre", type=float, default=5.0, help="seconds to keep before trigger"); sp.add_argument("--post", type=float, default=10.0, help="seconds to save after trigger"); sp.add_argument("--cooldown", type=float, default=30.0, help="seconds before saving another window"); sp.add_argument("--duration", type=float, default=0.0, help="seconds to run; 0 means indefinitely in rolling mode"); sp.add_argument("--tick-hz", type=int, default=50); sp.add_argument("--prompt-label", action="store_true", help="prompt for a label when an anomaly is saved"); sp.set_defaults(func=cmd_watcher)
+    sp = sub.add_parser("watcher"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to watch (default: {DEFAULT_PROJECT})"); sp.add_argument("--rolling", action="store_true", help="use rolling anomaly windows instead of scan recording"); sp.add_argument("--pre", type=float, default=5.0, help="seconds to keep before trigger"); sp.add_argument("--post", type=float, default=10.0, help="seconds to save after trigger"); sp.add_argument("--cooldown", type=float, default=30.0, help="seconds before saving another window"); sp.add_argument("--duration", type=float, default=0.0, help="seconds to run; 0 means indefinitely in rolling mode"); sp.add_argument("--tick-hz", type=int, default=50); sp.add_argument("--channels", default="portable", help="channel groups, e.g. portable or portable,linux"); sp.add_argument("--prompt-label", action="store_true", help="prompt for a label when an anomaly is saved"); sp.set_defaults(func=cmd_watcher)
     sp = sub.add_parser("label-candidate"); sp.add_argument("project_name"); sp.add_argument("scene_id"); sp.add_argument("--label", required=True); sp.add_argument("--notes", default=""); sp.set_defaults(func=cmd_label_candidate)
     sp = sub.add_parser("orbiter-run"); sp.add_argument("project_name"); sp.add_argument("scene_id"); sp.set_defaults(func=cmd_orbiter_run)
     sp = sub.add_parser("orbiter-evaluate"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT); sp.add_argument("--limit", type=int, default=20); sp.set_defaults(func=cmd_orbiter_evaluate)
