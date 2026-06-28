@@ -136,6 +136,19 @@ Channel groups keep dSense portable by default. `portable` is the default group.
 
 Use `python -m dsense` or `python -m dsense tui` for the full-screen recorder. By default it opens the base project at `datasets/base/`, loads all existing scenes from that project, and stores new captures there. To use another project, pass it explicitly, for example `python -m dsense tui demo_lab`.
 
+When the TUI opens on Linux/Fedora, dSense records a short local startup baseline scene labeled `baseline_startup_auto`, trains `exports/baseline_model.json`, and then opens the interface. This means the scene count should increase by one each time the TUI starts unless startup baseline capture is disabled. On non-Linux systems the default policy is `missing-only`, so dSense records this startup baseline only when no usable baseline model exists. dSense tries portable plus readable Linux channels for startup baselines; unavailable channels are skipped without privileged requirements.
+
+Startup baseline controls:
+
+```bash
+dsense tui base --no-auto-baseline
+dsense tui base --auto-baseline-policy off
+dsense tui base --auto-baseline-policy missing-only
+dsense tui base --auto-baseline-policy startup
+dsense tui base --force-auto-baseline
+dsense tui base --auto-baseline-duration 10
+```
+
 The TUI opens as a tabbed local control panel. The tab bar includes `Record`, `Scenes`, `Channels`, `Learn`, `Classify`, `Watcher`, `Orbiters`, `Transfer`, `Validate`, and `Help`. The `Record` tab keeps the editable capture setup with preset groups for `user`, `baseline`, and `activity` scenes. `Scenes` lets you browse recorded scenes and inspect wrapped scene notes. `Channels` shows adapter status. `Learn` and `Classify` show local model state. `Watcher`, `Orbiters`, `Transfer`, and `Validate` expose the project tools without leaving the terminal.
 
 It trains or refreshes local baseline/classifier models from accepted scenes, then records with a live overview of frame progress, current phase, timing drift, process estimate, and marker count.

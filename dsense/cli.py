@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse, csv, json, sys
 import curses
 from pathlib import Path
-from .baseline import train_and_save_project_baseline
+from .baseline import default_auto_baseline_policy, ensure_startup_baseline, train_and_save_project_baseline
 from .channels import parse_channel_groups
 from .classifier import train_and_save_project_classifier
 from .doctor import doctor_ok, print_doctor_report, run_doctor
@@ -170,7 +170,26 @@ def cmd_scene(args):
 
 def cmd_tui(args):
     project_name = args.project_name or DEFAULT_PROJECT
-    init_project(project_name)
+    print("Opening dSense...")
+    print(f"Project: {project_name}")
+    policy = "off" if args.no_auto_baseline else args.auto_baseline_policy
+    resolved_policy = default_auto_baseline_policy() if policy == "auto" else policy
+    print(f"Checking system baseline... policy={resolved_policy}")
+    status = ensure_startup_baseline(
+        project_name,
+        duration=args.auto_baseline_duration,
+        tick_hz=args.tick_hz,
+        policy=policy,
+        force=args.force_auto_baseline,
+    )
+    startup_baseline_status = str(status.get("message", "Startup baseline status unknown"))
+    print(startup_baseline_status)
+    if status.get("status") == "recorded":
+        print("Training baseline model...")
+        print("Baseline ready.")
+    elif status.get("status") == "failed":
+        print("Continuing without startup baseline.")
+    print("Opening TUI...")
     duration = args.duration or (args.pre_roll + args.action + args.post_roll)
     run_tui(CaptureConfig(
         project_name=project_name,
@@ -182,6 +201,7 @@ def cmd_tui(args):
         repeat=args.repeat,
         tick_hz=args.tick_hz,
         notes=args.notes,
+        startup_baseline_status=startup_baseline_status,
     ))
 
 
@@ -465,7 +485,7 @@ def build_parser():
     sp.add_argument("--yes", action="store_true", help="start and accept captures without prompts")
     sp.set_defaults(func=cmd_auto_scenes)
     sp = sub.add_parser("scene"); sp.add_argument("project_name"); sp.add_argument("--label", required=True); sp.add_argument("--duration", type=float); sp.add_argument("--pre-roll", type=float, default=2); sp.add_argument("--action", type=float, default=5); sp.add_argument("--post-roll", type=float, default=3); sp.add_argument("--repeat", type=int, default=1); sp.add_argument("--notes", default=""); sp.add_argument("--tick-hz", type=int, default=100); sp.add_argument("--channels", default="portable", help="channel groups, e.g. portable or portable,linux"); sp.add_argument("--yes", action="store_true", help="accept captures without prompt"); sp.add_argument("--tui", action="store_true", help="record with the full-screen interaction recorder"); sp.set_defaults(func=cmd_scene)
-    sp = sub.add_parser("tui"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to open (default: {DEFAULT_PROJECT})"); sp.add_argument("--label", default="user_interaction"); sp.add_argument("--duration", type=float); sp.add_argument("--pre-roll", type=float, default=2); sp.add_argument("--action", type=float, default=5); sp.add_argument("--post-roll", type=float, default=3); sp.add_argument("--repeat", type=int, default=1); sp.add_argument("--notes", default=""); sp.add_argument("--tick-hz", type=int, default=100); sp.set_defaults(func=cmd_tui)
+    sp = sub.add_parser("tui"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to open (default: {DEFAULT_PROJECT})"); sp.add_argument("--label", default="user_interaction"); sp.add_argument("--duration", type=float); sp.add_argument("--pre-roll", type=float, default=2); sp.add_argument("--action", type=float, default=5); sp.add_argument("--post-roll", type=float, default=3); sp.add_argument("--repeat", type=int, default=1); sp.add_argument("--notes", default=""); sp.add_argument("--tick-hz", type=int, default=100); sp.add_argument("--auto-baseline-policy", choices=["auto", "startup", "missing-only", "off"], default="auto", help="startup baseline policy; auto uses startup on Linux and missing-only elsewhere"); sp.add_argument("--no-auto-baseline", action="store_true", help="same as --auto-baseline-policy off"); sp.add_argument("--auto-baseline-duration", type=float, default=5.0, help="seconds for automatic startup baseline capture"); sp.add_argument("--force-auto-baseline", action="store_true", help="record a fresh startup baseline unless policy is off"); sp.set_defaults(func=cmd_tui)
     sp = sub.add_parser("list-scenes"); sp.add_argument("project_name"); sp.set_defaults(func=cmd_list)
     sp = sub.add_parser("export-preview"); sp.add_argument("project_name"); sp.set_defaults(func=cmd_export)
     sp = sub.add_parser("validate"); sp.add_argument("project_name"); sp.add_argument("--verbose", "-v", action="store_true", help="show detailed error messages"); sp.set_defaults(func=cmd_validate)

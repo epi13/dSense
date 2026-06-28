@@ -4,6 +4,7 @@ from dsense.manifest import DEFAULT_PROJECT, init_project
 from dsense.scenarios import SCENARIO_GROUPS
 from dsense.tui import (
     TABS,
+    clip_text,
     classifier_summary_lines,
     load_project_scenes,
     scene_detail_lines,
@@ -61,6 +62,18 @@ def test_wrap_text_handles_empty_and_long_notes():
     lines = wrap_text("alpha beta gamma delta", 10)
     assert lines == ["alpha beta", "gamma", "delta"]
     assert all(len(line) <= 10 for line in wrap_text("averyveryverylongword", 6))
+
+
+def test_clip_text_keeps_record_fields_inside_panel_width():
+    assert clip_text("short", 10) == "short"
+    assert clip_text("this is much too long", 12) == "this is m..."
+    assert len(clip_text("this is much too long", 12)) <= 12
+
+    prefix = f"{'>':1} {'Notes':<18} "
+    value_width = 35 - len(prefix)
+    lines = [clip_text(prefix + part, 35) for part in wrap_text("Start outside the sensing area on the left, enter during the action window.", value_width)]
+    assert lines
+    assert all(len(line) <= 35 for line in lines)
 
 
 def test_scene_detail_lines_handle_missing_and_long_notes_separately():

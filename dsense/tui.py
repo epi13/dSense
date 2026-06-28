@@ -41,6 +41,7 @@ class CaptureConfig:
     tick_hz: int = 100
     notes: str = ""
     workload_id: str | None = None
+    startup_baseline_status: str = ""
 
 
 class SceneRecorderTUI:
@@ -264,11 +265,27 @@ class SceneRecorderTUI:
         record_h = max(4, min(17, h - y - 4))
         self._box(y, 0, record_h, left_w, "Record")
         self._add(y + 1, 2, f"Project {self.config.project_name}")
-        for i, (name, title) in enumerate(fields[:max(1, record_h - 4)]):
+        field_y = y + 3
+        inner_width = max(1, left_w - 4)
+        max_field_rows = max(1, record_h - 4)
+        for i, (name, title) in enumerate(fields):
+            if field_y >= y + 3 + max_field_rows:
+                break
             marker = ">" if i == selected else " "
             value = self._field_value(name)
             attr = curses.A_REVERSE if i == selected else 0
-            self._add(y + 3 + i, 2, f"{marker} {title:<18} {value}", attr)
+            prefix = f"{marker} {title:<18} "
+            value_width = max(1, inner_width - len(prefix))
+            if name == "notes":
+                wrapped = wrap_text(value, value_width)
+                remaining = max(1, y + 3 + max_field_rows - field_y)
+                for line_index, wrapped_line in enumerate(wrapped[:remaining]):
+                    line_prefix = prefix if line_index == 0 else " " * len(prefix)
+                    self._add(field_y, 2, clip_text(line_prefix + wrapped_line, inner_width), attr)
+                    field_y += 1
+            else:
+                self._add(field_y, 2, clip_text(prefix + value, inner_width), attr)
+                field_y += 1
         right_x = left_w + 1
         right_w = max(4, w - right_x - 1)
         self._box(y, right_x, 9, right_w, "Status")
@@ -278,7 +295,10 @@ class SceneRecorderTUI:
         classifier_text = "not trained" if self.classifier is None else f"{self.classifier.scene_count} scenes"
         self._add(y + 4, right_x + 2, f"Baseline: {baseline_text}")
         self._add(y + 5, right_x + 2, f"Classifier: {classifier_text}")
-        self._add(y + 7, right_x + 2, "Press c to start capture")
+        if self.config.startup_baseline_status:
+            self._add(y + 7, right_x + 2, self.config.startup_baseline_status, self._color(2 if "failed" not in self.config.startup_baseline_status.lower() else 3))
+        else:
+            self._add(y + 7, right_x + 2, "Press c to start capture")
 
         notes_y = y + 10
         notes_h = max(4, h - notes_y - 4)
@@ -928,6 +948,17 @@ def wrap_text(text: str, width: int) -> list[str]:
         wrapped = textwrap.wrap(paragraph, width=width, break_long_words=True, break_on_hyphens=False) or [""]
         lines.extend(wrapped)
     return lines or ["(no notes)"]
+
+
+def clip_text(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    value = str(text)
+    if len(value) <= width:
+        return value
+    if width <= 3:
+        return value[:width]
+    return value[: width - 3] + "..."
 
 
 def tab_index_delta(index: int, delta: int) -> int:

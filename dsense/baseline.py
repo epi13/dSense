@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import platform
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -96,6 +97,84 @@ def load_project_baseline(project_name: str) -> BaselineModel | None:
         },
         feature_manifest=dict(data.get("feature_manifest", {})),
     )
+
+
+def project_has_usable_baseline(project_name: str) -> bool:
+    model = load_project_baseline(project_name)
+    return model is not None and model.scene_count > 0 and bool(model.channels)
+
+
+def default_auto_baseline_policy() -> str:
+    return "startup" if platform.system().lower() == "linux" else "missing-only"
+
+
+def ensure_startup_baseline(
+    project_name: str,
+    duration: float = 5.0,
+    tick_hz: int = 100,
+    policy: str = "auto",
+    force: bool = False,
+) -> dict[str, object]:
+    from .manifest import allocate_scene_id, init_project
+    from .recorder import record_scene
+
+    init_project(project_name)
+    resolved_policy = default_auto_baseline_policy() if policy == "auto" else policy
+    if resolved_policy not in {"startup", "missing-only", "off"}:
+        raise ValueError(f"Unknown auto-baseline policy: {policy}")
+    if resolved_policy == "off":
+        return {
+            "status": "skipped",
+            "recorded": False,
+            "scene_id": None,
+            "policy": resolved_policy,
+            "message": "Startup baseline: skipped by policy off",
+        }
+    if not force and resolved_policy == "missing-only" and project_has_usable_baseline(project_name):
+        return {
+            "status": "reused",
+            "recorded": False,
+            "scene_id": None,
+            "policy": resolved_policy,
+            "message": "Startup baseline: reused existing model",
+        }
+
+    try:
+        scene_id = allocate_scene_id(project_name)
+        scene_dir = project_path(project_name) / "scenes" / scene_id
+        scene = record_scene(
+            scene_dir,
+            scene_id,
+            "baseline_startup_auto",
+            max(0.01, duration),
+            max(1, tick_hz),
+            0.0,
+            max(0.01, duration),
+            0.0,
+            "Automatically recorded startup baseline when dSense TUI opened.",
+            mode="baseline_auto",
+            channel_groups=("portable", "linux"),
+        )
+        model = train_and_save_project_baseline(project_name)
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "recorded": False,
+            "scene_id": None,
+            "policy": resolved_policy,
+            "message": f"Startup baseline: failed: {exc}",
+        }
+
+    return {
+        "status": "recorded",
+        "recorded": True,
+        "scene_id": scene_id,
+        "scene": scene,
+        "policy": resolved_policy,
+        "baseline_scene_count": model.scene_count,
+        "channel_count": len(model.channels),
+        "message": f"Startup baseline: recorded {scene_id}",
+    }
 
 
 def score_against_baseline(values: dict[str, float], model: BaselineModel | None) -> dict[str, object]:
