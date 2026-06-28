@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import curses
+import queue
+import threading
 import time
 from collections import deque
 
@@ -15,8 +17,16 @@ from .manifest import allocate_scene_id, init_project, project_path, scan_channe
 from .orbiters import read_recent_orbiter_summaries
 from .recorder import record_scene
 from .scenarios import SCENARIO_GROUPS
+from .startup_progress import OPTIONAL_STARTUP_STEPS, initial_progress_rows, make_progress, progress_warning
 from .transfer import transfer_bundle_path
 from .timeseries import TimeSeriesModel, load_project_timeseries
+from .tui_live import (
+    LiveObservation,
+    LiveSampler,
+    LiveSessionWriter,
+    build_live_observation,
+    save_live_snapshot,
+)
 from .tui_jobs import TuiJobManager, evaluate_project_job, export_transfer_job, run_watcher_job, train_baseline, train_classifier, update_intelligence_job, validate_project
 from .tui_render import (
     MIN_TUI_HEIGHT,
@@ -25,13 +35,16 @@ from .tui_render import (
     channel_state_label,
     classifier_summary_lines,
     clip_text,
+    compact_live_observation_lines,
     council_summary_lines,
     evaluation_repeatability_lines,
     format_metric_value,
     labels_needing_more_takes,
+    live_observation_lines,
     profile_line,
     robust_channel_score,
     scene_detail_lines,
+    sense_radar_lines,
     scheduled_scene_events,
     summarize_scene_counts,
     sparkline,
@@ -57,7 +70,7 @@ class SceneRecorderTUI:
         self.classifier: SceneClassifierModel | None = None
         self.timeseries: TimeSeriesModel | None = None
         self.intelligence_state: dict[str, object] | None = load_intelligence_state(config.project_name)
-        self.tab_index = 0
+        self.tab_index = self._initial_tab_index(config.start_tab)
         self.phase_index = 0
         self.scene_index = max(0, len(self.scenes) - 1)
         self.scene_scroll = 0
@@ -74,7 +87,17 @@ class SceneRecorderTUI:
         self.channel_history: dict[str, deque[float]] = {}
         self.detector_state = DetectorState()
         self.last_draw = 0.0
+        self.live_sampler: LiveSampler | None = None
+        self.live_writer = LiveSessionWriter(config.project_name)
+        self.live_observation: LiveObservation | None = None
+        self.live_rows: deque[dict[str, float]] = deque(maxlen=max(8, int(config.tick_hz)))
+        self.live_started_monotonic = time.monotonic()
+        self.live_message = ""
         self._apply_selected_scenario()
+
+    def _initial_tab_index(self, start_tab: str) -> int:
+        requested = {"capture": "Capture", "live": "Live", "radar": "Sense Radar", "sense-radar": "Sense Radar"}.get(start_tab.lower(), start_tab.title())
+        return TABS.index(requested) if requested in TABS else 0
 
     def _train_classifier(self) -> SceneClassifierModel | None:
         return train_classifier(self.config.project_name)
@@ -92,14 +115,22 @@ class SceneRecorderTUI:
         self.screen.timeout(250)
         self._setup_colors()
         self._run_startup_pipeline()
+        try:
+            return self._main_loop()
+        finally:
+            self._close_live_sampler()
+
+    def _main_loop(self) -> list[dict[str, object]]:
         all_results = []
         while True:
-            if not self._configure():
+            action = self._configure()
+            if action == "quit":
                 return all_results
-            self._confirm_ready()
-            results = self._record_session()
-            all_results.extend(results)
-            self._complete(results)
+            if action == "record":
+                self._confirm_ready()
+                results = self._record_session()
+                all_results.extend(results)
+                self._complete(results)
 
     def _record_session(self) -> list[dict[str, object]]:
         results = []
@@ -160,63 +191,92 @@ class SceneRecorderTUI:
         self._run_council_startup_pipeline()
 
     def _run_council_startup_pipeline(self) -> None:
-        steps = [
-            {"key": "doctor", "label": "doctor", "status": "pending", "detail": ""},
-            {"key": "intelligence", "label": "update intelligence", "status": "pending", "detail": ""},
-            {"key": "dashboard", "label": "open dashboard", "status": "pending", "detail": ""},
-        ]
-
-        def set_step(key: str, status: str, detail: str = "") -> None:
-            for step in steps:
-                if step["key"] == key:
-                    step["status"] = status
-                    step["detail"] = detail
-                    break
-            self._draw_startup_pipeline(steps)
-
-        set_step("doctor", "active")
-        checks = run_doctor(self.config.project_name)
-        set_step("doctor", "done" if doctor_ok(checks) else "warn", f"{sum(1 for check in checks if check.status != 'ok')} warnings")
-
-        set_step("intelligence", "active", "starting")
+        progress_rows = initial_progress_rows()
+        events: queue.Queue[dict[str, object]] = queue.Queue()
+        done = threading.Event()
+        skip_steps: set[str] = set()
+        state_holder: dict[str, object] = {}
+        error_holder: dict[str, object] = {}
         started = time.monotonic()
-        council_steps: list[dict[str, object]] = []
 
         def progress(update: dict[str, object]) -> None:
-            step = dict(update.get("step", {}))
-            name = str(step.get("name", ""))
-            status = str(step.get("status", "pending"))
-            detail = _step_detail(step)
-            existing = next((item for item in council_steps if item.get("key") == name), None)
-            row = {"key": name, "label": name.replace("_", " "), "status": _ui_status(status), "detail": detail}
-            if existing is None:
-                council_steps.append(row)
-            else:
-                existing.update(row)
-            self._draw_startup_pipeline([steps[0], *council_steps[-10:], steps[-1]])
+            events.put(dict(update))
 
-        state = run_intelligence_update(
-            self.config.project_name,
-            startup=True,
-            run_watchers=self.config.startup_watchers,
-            run_orbiters=self.config.startup_orbiters,
-            run_training=self.config.startup_training,
-            run_transfer=True,
-            progress_callback=progress,
-        )
+        def worker() -> None:
+            try:
+                checks = run_doctor(self.config.project_name)
+                if not doctor_ok(checks):
+                    events.put(make_progress("init_project", "running", progress=None, message=f"doctor warnings: {sum(1 for check in checks if check.status != 'ok')}"))
+                state_holder["state"] = run_intelligence_update(
+                    self.config.project_name,
+                    startup=True,
+                    run_watchers=self.config.startup_watchers and not self.config.fast_start,
+                    run_orbiters=self.config.startup_orbiters and not self.config.fast_start,
+                    run_training=self.config.startup_training and not self.config.fast_start,
+                    run_transfer=not self.config.fast_start,
+                    force_update=self.config.force_startup_update,
+                    skip_steps=skip_steps,
+                    progress_callback=progress,
+                )
+            except Exception as exc:
+                error_holder["error"] = str(exc)
+            finally:
+                done.set()
+
+        thread = threading.Thread(target=worker, name="dsense-startup-intelligence", daemon=True)
+        thread.start()
+        self.screen.timeout(150)
+        message = "Fast start: loading existing artifacts" if self.config.fast_start else ""
+        frame = 0
+        while not done.is_set() or not events.empty():
+            while True:
+                try:
+                    event = events.get_nowait()
+                except queue.Empty:
+                    break
+                name = str(event.get("name", ""))
+                if name:
+                    progress_rows[name] = event
+            current = _current_running_step(progress_rows)
+            if current is not None:
+                elapsed = float(current.get("elapsed_s", 0.0) or 0.0)
+                warning = progress_warning(str(current.get("name", "")), elapsed)
+                if warning:
+                    current["warning"] = warning
+            self._draw_startup_progress(progress_rows, message, frame)
+            frame += 1
+            key = self.screen.getch()
+            if key in (ord("q"), ord("Q")):
+                error_holder["error"] = "startup cancelled by user"
+                break
+            if key in (ord("s"), ord("S")):
+                current = _current_running_step(progress_rows)
+                current_name = str(current.get("name", "")) if current else ""
+                if current_name in OPTIONAL_STARTUP_STEPS:
+                    skip_steps.add(current_name)
+                    progress_rows[current_name] = make_progress(current_name, "skipped", progress=1.0, message="skip requested")
+                    message = f"Skip requested for {current_name}."
+                else:
+                    message = "This step cannot be skipped safely."
+        thread.join(timeout=0.1)
+        if error_holder.get("error"):
+            self.live_message = str(error_holder["error"])
+        state = state_holder.get("state") if isinstance(state_holder.get("state"), dict) else load_intelligence_state(self.config.project_name)
+        if state is None:
+            state = load_intelligence_state(self.config.project_name) or {}
         self.intelligence_state = state
         self.baseline = load_project_baseline(self.config.project_name)
         self.classifier = self._load_classifier()
         self.timeseries = load_project_timeseries(self.config.project_name)
-        self.validation_summary = self._validation_summary_from_state(state)
-        self.evaluation_report = dict(dict(state.get("models", {})).get("evaluation", {}))
-        status = str(state.get("status", "unknown"))
-        council = dict(state.get("council", {}))
+        self.validation_summary = self._validation_summary_from_state(state) if state else "not run"
+        self.evaluation_report = dict(dict(state.get("models", {})).get("evaluation", {})) if state else None
+        status = str(state.get("status", "unknown")) if state else "failed"
+        council = dict(state.get("council", {})) if state else {}
         detail = f"{status} confidence={council.get('overall_confidence', 0.0)}"
         self.job_manager.add_completed("update intelligence", detail, "done" if status in {"ok", "warning"} else "error", time.monotonic() - started)
 
         self.scenes = load_project_scenes(self.config.project_name)
-        set_step("dashboard", "done", "ready")
+        self._draw_startup_progress(progress_rows, "Opening Live View", frame)
         time.sleep(0.4)
 
     def _run_startup_baseline_step(self, set_step) -> None:
@@ -309,8 +369,8 @@ class SceneRecorderTUI:
     def _draw_startup_pipeline(self, steps: list[dict[str, object]]) -> None:
         self.screen.erase()
         h, w = self.screen.getmaxyx()
-        self._title("Startup Pipeline", self.config.project_name)
-        self._add(2, 2, "dSense is preparing the project. Long startup work is shown here as it happens.")
+        self._title("LIVE OBSERVATORY", self.config.project_name)
+        self._add(2, 2, "Startup intelligence status: local evidence layers are refreshing before live telemetry opens.")
         row = 4
         for step in steps:
             if row >= h - 2:
@@ -325,7 +385,47 @@ class SceneRecorderTUI:
             row += 1
         self.screen.refresh()
 
-    def _configure(self) -> bool:
+    def _draw_startup_progress(self, rows: dict[str, dict[str, object]], message: str = "", frame: int = 0) -> None:
+        self.screen.erase()
+        h, w = self.screen.getmaxyx()
+        self._title("dSense Startup Intelligence", self.config.project_name)
+        flags = []
+        if self.config.fast_start:
+            flags.append("fast-start")
+        if not self.config.startup_orbiters:
+            flags.append("orbiters disabled")
+        if not self.config.startup_watchers:
+            flags.append("watchers disabled")
+        if not self.config.startup_training:
+            flags.append("training disabled")
+        if self.config.force_startup_update:
+            flags.append("force update")
+        if flags:
+            self._add(1, 2, clip_text(" | ".join(flags), max(1, w - 4)), self._color(3))
+        row = 3
+        for name in rows:
+            if row >= h - 3:
+                break
+            item = rows[name]
+            self._add(row, 2, clip_text(_startup_progress_line(item, frame, max(10, w - 34)), max(1, w - 4)), self._startup_color(str(item.get("status", "pending"))))
+            row += 1
+        current = _current_running_step(rows)
+        current_message = message or (str(current.get("message", "")) if current else "")
+        if current_message and h >= 5:
+            self._add(h - 3, 2, clip_text(f"Current: {current_message}", max(1, w - 4)), self._color(3 if "cannot" in current_message else 0))
+        self._add(h - 2, 2, clip_text("u update again | s skip current safe step | q quit", max(1, w - 4)))
+        self.screen.refresh()
+
+    def _startup_color(self, status: str) -> int:
+        if status == "done":
+            return self._color(2)
+        if status == "running":
+            return self._color(1)
+        if status in {"failed", "skipped"}:
+            return self._color(3)
+        return 0
+
+    def _configure(self) -> str:
         self.screen.timeout(250)
         fields = [
             ("mode", "Mode"),
@@ -343,6 +443,7 @@ class SceneRecorderTUI:
         ]
         idx = 0
         while True:
+            self._update_live_observation()
             self._draw_config(fields, idx)
             key = self.screen.getch()
             if key == -1:
@@ -362,11 +463,11 @@ class SceneRecorderTUI:
                 self._move_scene_selection(-1)
             elif current_tab == "Scenes" and key in (curses.KEY_DOWN, ord("j")):
                 self._move_scene_selection(1)
-            elif current_tab == "Record" and key in (curses.KEY_UP, ord("k")):
+            elif current_tab == "Capture" and key in (curses.KEY_UP, ord("k")):
                 idx = max(0, idx - 1)
-            elif current_tab == "Record" and key in (curses.KEY_DOWN, ord("j")):
+            elif current_tab == "Capture" and key in (curses.KEY_DOWN, ord("j")):
                 idx = min(len(fields) - 1, idx + 1)
-            elif current_tab == "Record" and key in (10, 13):
+            elif current_tab == "Capture" and key in (10, 13):
                 name, title = fields[idx]
                 if name == "mode":
                     self._cycle_mode()
@@ -379,8 +480,10 @@ class SceneRecorderTUI:
                 else:
                     value = self._prompt(f"{title}", str(getattr(self.config, name)))
                     self._set_config_value(name, value)
-            elif key in (ord("m"), ord("M")):
+            elif key in (ord("m"), ord("M")) and current_tab == "Capture":
                 self._cycle_mode()
+            elif key in (ord("m"), ord("M")):
+                self._mark_live_interval()
             elif key in (ord("p"), ord("P")):
                 self._cycle_scenario(1)
             elif key in (ord("o"), ord("O")):
@@ -389,10 +492,15 @@ class SceneRecorderTUI:
                 self.config.record_group = not self.config.record_group
             elif key in (ord("a"), ord("A")):
                 self.config.auto_detect = not self.config.auto_detect
-            elif key in (ord("s"), ord("S")):
+            elif key in (ord("s"), ord("S")) and current_tab == "Capture":
                 self.config.duration = self.config.pre_roll + self.config.action + self.config.post_roll
-            elif key in (ord("r"), ord("R")):
+            elif key in (ord("s"), ord("S")):
+                self._save_live_snapshot()
+            elif key in (ord("r"), ord("R")) and current_tab == "Capture":
                 self.channels = scan_channels(groups=self.config.channel_groups)
+            elif key in (ord("r"), ord("R")):
+                self._prefill_capture_from_live()
+                self.tab_index = TABS.index("Capture")
             elif key in (ord("u"), ord("U")):
                 self._start_intelligence_job()
             elif key in (ord("t"), ord("T")):
@@ -406,10 +514,10 @@ class SceneRecorderTUI:
             elif current_tab == "Jobs" and key in (ord("x"), ord("X")):
                 self.job_manager.cancel_running()
             elif key in (ord("c"), ord("C")):
-                if current_tab == "Record":
-                    return True
+                if current_tab == "Capture":
+                    return "record"
             elif key in (ord("q"), ord("Q")):
-                return False
+                return "quit"
 
     def _draw_config(self, fields: list[tuple[str, str]], selected: int) -> None:
         self.screen.erase()
@@ -421,33 +529,27 @@ class SceneRecorderTUI:
         self._title("dSense Control Panel", self.config.project_name)
         self._draw_tabs(1, 0, w)
         tab = TABS[self.tab_index]
-        if tab == "Record":
+        if tab == "Live":
+            self._draw_live_tab(3, h, w)
+        elif tab == "Sense Radar":
+            self._draw_sense_radar_tab(3, h, w)
+        elif tab == "Capture":
             self._draw_record_tab(fields, selected, 3, h, w)
         elif tab == "Scenes":
             self._draw_scenes_tab(3, h, w)
-        elif tab == "Channels":
-            self._draw_channels_tab(3, h, w)
         elif tab == "Council":
             self._draw_council_tab(3, h, w)
-        elif tab == "Learn":
-            self._draw_learn_tab(3, h, w)
-        elif tab == "Classify":
-            self._draw_classify_tab(3, h, w)
         elif tab == "Evaluation":
             self._draw_evaluation_tab(3, h, w)
-        elif tab == "Jobs":
-            self._draw_jobs_tab(3, h, w)
-        elif tab == "Watcher":
+        elif tab == "Watchers":
             self._draw_watcher_tab(3, h, w)
         elif tab == "Orbiters":
             self._draw_orbiters_tab(3, h, w)
         elif tab == "Transfer":
             self._draw_transfer_tab(3, h, w)
-        elif tab == "Validate":
-            self._draw_validate_tab(3, h, w)
-        elif tab == "Help":
-            self._draw_help_tab(3, h, w)
-        self._add(h - 2, 2, "TAB tabs | c record | u update intelligence | v validate | e export | q exit")
+        elif tab == "Settings":
+            self._draw_settings_tab(3, h, w)
+        self._add(h - 2, 2, "m mark | r record | u update intelligence | s snapshot | tab tabs | q quit")
         self.screen.refresh()
 
     def _draw_tabs(self, y: int, x: int, width: int) -> None:
@@ -505,6 +607,42 @@ class SceneRecorderTUI:
         self._box(notes_y, right_x, notes_h, right_w, "Notes")
         self._add_wrapped(notes_y + 2, right_x + 2, self.config.notes or "(no notes)", max(1, right_w - 4), max(1, notes_h - 3))
 
+    def _draw_live_tab(self, y: int, h: int, w: int) -> None:
+        panel_h = max(4, h - y - 4)
+        self._box(y, 0, panel_h, w - 1, "Live Observatory")
+        lines = (
+            compact_live_observation_lines(self.live_observation, max(1, w - 4))
+            if panel_h < 16 or w < 72
+            else live_observation_lines(self.live_observation, max(1, w - 4))
+        )
+        row = y + 1
+        if self.live_message:
+            self._add(row, 2, clip_text(self.live_message, max(1, w - 4)), self._color(3))
+            row += 1
+        if not self.config.startup_intelligence:
+            self._add(row, 2, "Startup intelligence disabled for this session; showing existing model state only.", self._color(3))
+            row += 1
+        for line in lines:
+            if row >= y + panel_h - 1:
+                break
+            color = self._color(3 if "unknown anomaly" in line.lower() or "needs validation" in line.lower() else 1 if line in {"Telemetry", "Sense Radar", "Intelligence Council", "Known Anomalies", "Unknown Anomalies"} else 0)
+            self._add(row, 2, clip_text(line, max(1, w - 4)), color)
+            row += 1
+
+    def _draw_sense_radar_tab(self, y: int, h: int, w: int) -> None:
+        panel_h = max(4, h - y - 4)
+        self._box(y, 0, panel_h, w - 1, "Sense Radar - experimental proximity hypothesis")
+        proximity = self.live_observation.proximity_hypothesis if self.live_observation is not None else {}
+        agreement = self.live_observation.council_agreement if self.live_observation is not None else "unknown"
+        lines = [
+            "Experimental visualization of local signal anomalies, not literal radar.",
+            "It does not prove biological presence; hypotheses need repeated labeled samples.",
+            "",
+            *sense_radar_lines(proximity, agreement, max(1, w - 4)),
+        ]
+        for i, line in enumerate(lines[:max(1, panel_h - 2)]):
+            self._add(y + 1 + i, 2, clip_text(line, max(1, w - 4)), self._color(3 if "does not prove" in line or "needs validation" in line else 0))
+
     def _draw_scenes_tab(self, y: int, h: int, w: int) -> None:
         list_w = max(28, min(w - 2, w // 2))
         detail_x = list_w + 1
@@ -560,6 +698,25 @@ class SceneRecorderTUI:
             if reason and reason != "ok" and row < y + panel_h - 1:
                 self._add(row, 4, reason[:max(1, w - 8)], self._color(3))
                 row += 1
+
+    def _draw_settings_tab(self, y: int, h: int, w: int) -> None:
+        panel_h = max(4, h - y - 4)
+        left_w = max(28, min(w - 2, w // 2))
+        self._box(y, 0, panel_h, left_w, "Settings")
+        self._add(y + 1, 2, f"Project: {self.config.project_name}")
+        self._add(y + 2, 2, f"Channels: {','.join(self.config.channel_groups)}")
+        self._add(y + 3, 2, f"Startup intelligence: {'on' if self.config.startup_intelligence else 'off'}")
+        self._add(y + 4, 2, f"Tick Hz: {self.config.tick_hz}")
+        self._add(y + 6, 2, "Capture settings live on the Capture tab.")
+        right_x = left_w + 1
+        right_w = max(4, w - right_x - 1)
+        self._box(y, right_x, panel_h, right_w, "Channels")
+        self._add(y + 1, right_x + 2, "ID                         Status")
+        row = y + 3
+        for ch in self.channels[:max(1, panel_h - 5)]:
+            status = "online" if ch.get("available") else "offline"
+            self._add(row, right_x + 2, clip_text(f"{ch.get('id', ''):<26} {status}", max(1, right_w - 4)), self._color(2 if ch.get("available") else 4))
+            row += 1
 
     def _draw_learn_tab(self, y: int, h: int, w: int) -> None:
         panel_h = max(4, h - y - 4)
@@ -1202,6 +1359,80 @@ class SceneRecorderTUI:
         except (OSError, ValueError):
             return None
 
+    def _update_live_observation(self) -> None:
+        try:
+            if self.live_sampler is None:
+                self.live_sampler = LiveSampler(self.config.channel_groups, min(max(1, self.config.tick_hz), 20))
+                self.live_started_monotonic = time.monotonic()
+            values, status, _ = self.live_sampler.sample()
+            self.live_rows.append(values)
+            tick = self.live_sampler.tick
+            elapsed = max(0.001, time.monotonic() - self.live_started_monotonic)
+            watcher_events = read_recent_watcher_events(self.config.project_name, 5)
+            self.live_observation = build_live_observation(
+                self.config.project_name,
+                tick=tick,
+                elapsed_s=elapsed,
+                channel_values=values,
+                channel_status=status,
+                recent_rows=list(self.live_rows),
+                baseline=self.baseline,
+                classifier=self.classifier,
+                timeseries=self.timeseries,
+                council_state=self.intelligence_state,
+                watcher_events=watcher_events,
+            )
+            self.live_writer.maybe_write(self.live_observation)
+        except Exception as exc:
+            self.live_message = f"Live telemetry unavailable: {exc}"
+            self._close_live_sampler()
+
+    def _close_live_sampler(self) -> None:
+        if self.live_sampler is None:
+            return
+        self.live_sampler.close()
+        self.live_sampler = None
+
+    def _mark_live_interval(self) -> None:
+        if self.live_observation is None:
+            self.live_message = "No live interval available to mark yet."
+            return
+        self.live_writer.maybe_write(self.live_observation, force=True, event="user_mark_interval")
+        self.live_message = "Marked current live interval."
+
+    def _save_live_snapshot(self) -> None:
+        if self.live_observation is None:
+            self.live_message = "No live snapshot available yet."
+            return
+        path = save_live_snapshot(self.config.project_name, self.live_observation)
+        self.live_writer.maybe_write(self.live_observation, force=True, event="snapshot_saved")
+        self.live_message = f"Saved live snapshot: {path}"
+
+    def _prefill_capture_from_live(self) -> None:
+        if self.live_observation is None:
+            self.config.label = "live_disturbance_review"
+            self.config.notes = "Opened Capture from Live Observatory before a live observation was available."
+            return
+        unknown = self.live_observation.unknown_anomalies[:1]
+        known = self.live_observation.known_anomalies[:1]
+        top = dict((unknown or known or [{}])[0])
+        recommended = str(top.get("action", "record scene"))
+        label_hint = str(top.get("name", "live_disturbance_review")).replace("?", "")
+        if self.live_observation.interval_classification == "normal":
+            label_hint = "live_control_interval"
+            recommended = "ignore once or mark interval"
+        self.config.label = label_hint if label_hint and label_hint != "unclassified pattern" else "live_unknown_disturbance"
+        self.config.notes = (
+            "Opened from Live Observatory. "
+            f"interval={self.live_observation.interval_classification}; "
+            f"baseline_score={self.live_observation.baseline_score}; "
+            f"watcher_score={self.live_observation.watcher_score}; "
+            f"agreement={self.live_observation.council_agreement}; "
+            f"recommended_action={recommended}. "
+            "Experimental local signal hypothesis; needs repeated validation."
+        )
+        self.live_message = "Capture prefilled from current live anomaly context. Press c from Capture to record."
+
     def _validation_summary_from_state(self, state: dict[str, object]) -> str:
         for step in list(state.get("steps", [])):
             row = dict(step)
@@ -1425,3 +1656,36 @@ def _ui_status(status: str) -> str:
         "failed": "warn",
         "skipped": "skipped",
     }.get(status, status)
+
+
+def _current_running_step(rows: dict[str, dict[str, object]]) -> dict[str, object] | None:
+    for row in rows.values():
+        if row.get("status") == "running":
+            return row
+    return None
+
+
+def _startup_progress_line(item: dict[str, object], frame: int, bar_width: int = 20) -> str:
+    status = str(item.get("status", "pending"))
+    label = str(item.get("label", item.get("name", "")))
+    progress = item.get("progress")
+    elapsed = float(item.get("elapsed_s", 0.0) or 0.0)
+    message = str(item.get("error") or item.get("warning") or item.get("message") or "")
+    if isinstance(progress, (int, float)):
+        pct = max(0.0, min(1.0, float(progress)))
+        filled = int(round(pct * bar_width))
+        bar = "█" * filled + "░" * max(0, bar_width - filled)
+        pct_text = f"{pct * 100:3.0f}%"
+    elif status == "running":
+        spinner = "◐◓◑◒"[frame % 4]
+        bar = f"{spinner} working...".ljust(bar_width)
+        pct_text = "   "
+    else:
+        bar = "░" * bar_width
+        pct_text = "  0%"
+    count = ""
+    current = item.get("current")
+    total = item.get("total")
+    if current is not None and total is not None:
+        count = f" {current}/{total}"
+    return f"[{status:<7}] {label:<16} {bar} {pct_text} {elapsed:5.1f}s{count}  {message}".rstrip()

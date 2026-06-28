@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 
 from .baseline import load_project_baseline, score_against_baseline, train_and_save_project_baseline
@@ -15,6 +16,10 @@ from .utils.timebase import utc_now_iso
 
 def orbiter_dir(project_root: Path) -> Path:
     return project_root / "exports" / "orbiters"
+
+
+def orbiters_state_path(project_name: str) -> Path:
+    return project_path(project_name) / "exports" / "orbiters_state.json"
 
 
 def make_orbiter_summary(
@@ -128,8 +133,9 @@ def evaluate_project_orbiters(project_name: str) -> dict[str, object]:
     }
 
 
-def append_orbiter_summary(project_root: Path, summary: dict[str, object]) -> Path:
-    summary = enrich_orbiter_summary(summary)
+def append_orbiter_summary(project_root: Path, summary: dict[str, object], *, enrich: bool = True) -> Path:
+    if enrich:
+        summary = enrich_orbiter_summary(summary)
     out_dir = orbiter_dir(project_root)
     ensure_dir(out_dir)
     path = out_dir / "summaries.jsonl"
@@ -138,12 +144,74 @@ def append_orbiter_summary(project_root: Path, summary: dict[str, object]) -> Pa
     return path
 
 
+def update_project_orbiters_incremental(
+    project_name: str,
+    *,
+    limit: int = 25,
+    force: bool = False,
+    enrich: bool = False,
+    progress_callback=None,
+) -> dict[str, object]:
+    root = project_path(project_name)
+    events = _recent_jsonl_rows(root / "watcher" / "events.jsonl", limit)
+    fingerprint = _events_fingerprint(events)
+    state_path = orbiters_state_path(project_name)
+    previous = {}
+    if state_path.exists():
+        try:
+            previous = json.loads(state_path.read_text(encoding="utf-8"))
+        except ValueError:
+            previous = {}
+    if not events:
+        state = _write_orbiters_state(project_name, "skipped", 0, fingerprint, "skipped: no watcher events")
+        _progress(progress_callback, "skipped: no watcher events", 0, 0, 1.0)
+        return state
+    if not force and previous.get("source_fingerprint") == fingerprint:
+        state = _write_orbiters_state(project_name, "ok", int(previous.get("processed_events", 0) or 0), fingerprint, "up to date")
+        _progress(progress_callback, "up to date", len(events), len(events), 1.0)
+        return state
+
+    baseline = load_project_baseline(project_name) or train_and_save_project_baseline(project_name)
+    classifier = load_project_classifier(project_name) or train_and_save_project_classifier(project_name)
+    summaries = []
+    total = len(events)
+    _progress(progress_callback, f"summarizing {total} recent watcher events", 0, total, 0.0)
+    for index, event in enumerate(events, start=1):
+        scene_id = str(event.get("scene_id", ""))
+        scene_dir = root / "scenes" / scene_id
+        if not scene_id or not scene_dir.exists():
+            _progress(progress_callback, f"skipping missing scene {scene_id or '?'}", index, total, index / max(total, 1))
+            continue
+        preview = scene_dir / "preview.csv"
+        rows = read_preview_rows(preview) if preview.exists() else []
+        latest = rows[-1] if rows else {}
+        baseline_status = score_against_baseline(_core_values(latest), baseline)
+        prediction = predict_scene(classifier, preview)
+        anomaly_score = float(event.get("anomaly_score", baseline_status.get("score", 0.0)) or 0.0)
+        summary = make_orbiter_summary(
+            scene_id,
+            baseline_status,
+            prediction,
+            _int_value(latest.get("availability_mask"), 0),
+            _int_value(latest.get("quality_flags"), 0),
+            anomaly_score,
+        )
+        summary["startup_incremental"] = True
+        append_orbiter_summary(root, summary, enrich=enrich)
+        summaries.append({"scene_id": scene_id, "confidence": prediction.get("confidence", 0.0), "anomaly_score": anomaly_score})
+        _progress(progress_callback, f"summarized {scene_id}", index, total, index / max(total, 1))
+
+    state = _write_orbiters_state(project_name, "ok", len(summaries), fingerprint, None)
+    state["summaries"] = summaries
+    return state
+
+
 def read_recent_orbiter_summaries(project_root: Path, limit: int = 5) -> list[dict[str, object]]:
     path = orbiter_dir(project_root) / "summaries.jsonl"
     if not path.exists():
         return []
     rows = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in _tail_lines(path, max(limit * 4, limit)):
         if line.strip():
             try:
                 rows.append(json.loads(line))
@@ -246,3 +314,48 @@ def _int_value(value: object, default: int) -> int:
         return int(float(value)) if value not in (None, "") else default
     except (TypeError, ValueError):
         return default
+
+
+def _recent_jsonl_rows(path: Path, limit: int) -> list[dict[str, object]]:
+    if not path.exists():
+        return []
+    rows = []
+    for line in _tail_lines(path, max(limit * 4, limit)):
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            continue
+    return rows[-limit:]
+
+
+def _tail_lines(path: Path, limit: int) -> list[str]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    return lines[-limit:]
+
+
+def _events_fingerprint(events: list[dict[str, object]]) -> str:
+    payload = json.dumps(events, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _write_orbiters_state(project_name: str, status: str, processed_events: int, fingerprint: str, skipped_reason: str | None) -> dict[str, object]:
+    path = orbiters_state_path(project_name)
+    ensure_dir(path.parent)
+    state = {
+        "format": "dsense-orbiters-state-v1",
+        "updated_utc": utc_now_iso(),
+        "status": status,
+        "processed_events": processed_events,
+        "source_fingerprint": fingerprint,
+        "summary_path": str(orbiter_dir(project_path(project_name)) / "summaries.jsonl"),
+        "skipped_reason": skipped_reason,
+    }
+    path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return state
+
+
+def _progress(callback, message: str, current: int | None, total: int | None, progress: float | None) -> None:
+    if callback is not None:
+        callback({"message": message, "current": current, "total": total, "progress": progress})

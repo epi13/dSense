@@ -35,6 +35,10 @@ class CaptureConfig:
     startup_watchers: bool = True
     startup_orbiters: bool = True
     startup_training: bool = True
+    live: bool = True
+    start_tab: str = "live"
+    fast_start: bool = False
+    force_startup_update: bool = False
 
 
 @dataclass

@@ -7,7 +7,7 @@ from dsense.classifier import SceneClassifierModel
 from dsense.manifest import DEFAULT_PROJECT, init_project
 from dsense.tui_state import AppState, CaptureConfig, JobState, RecordingState
 from dsense.tui_jobs import TuiJobManager
-from dsense.tui_render import robust_channel_score, sparkline, value_channel_id
+from dsense.tui_render import compact_live_observation_lines, live_footer_text, live_observation_lines, robust_channel_score, sparkline, value_channel_id
 from dsense.tui_render import evaluation_repeatability_lines, labels_needing_more_takes, useful_channel_lines
 from dsense.scenarios import SCENARIO_GROUPS
 from dsense.tui import (
@@ -144,6 +144,31 @@ def test_tui_parser_accepts_channel_groups():
     assert args.channels == "portable,linux"
 
 
+def test_live_cli_parser_accepts_live_and_start_tabs():
+    parser = build_parser()
+    live = parser.parse_args(["live", "base"])
+    tui_live = parser.parse_args(["tui", "base", "--live"])
+    start_live = parser.parse_args(["tui", "base", "--start-tab", "live"])
+    start_capture = parser.parse_args(["tui", "base", "--start-tab", "capture"])
+
+    assert live.project_name == "base"
+    assert tui_live.live is True
+    assert start_live.start_tab == "live"
+    assert start_capture.start_tab == "capture"
+
+
+def test_startup_performance_flags_parse():
+    parser = build_parser()
+    fast = parser.parse_args(["tui", "base", "--fast-start"])
+    force = parser.parse_args(["tui", "base", "--force-startup-update", "--no-startup-orbiters"])
+    alias = parser.parse_args(["tui-fast", "base"])
+
+    assert fast.fast_start is True
+    assert force.force_startup_update is True
+    assert force.no_startup_orbiters is True
+    assert alias.project_name == "base"
+
+
 def test_intelligence_cli_commands_parse():
     parser = build_parser()
 
@@ -200,6 +225,7 @@ def test_tui_command_passes_channel_groups_to_capture_config(tmp_path, monkeypat
     assert captured["auto_baseline_policy"] == "off"
     assert captured["startup_suite_enabled"] is False
     assert captured["startup_suite_target"] == 200
+    assert captured["start_tab"] == "live"
 
 
 def test_tui_no_startup_intelligence_disables_startup_work(tmp_path, monkeypatch):
@@ -245,18 +271,32 @@ def test_tui_scenario_groups_include_baseline_activity_and_user_presets():
 
 
 def test_tui_tabs_include_expected_sections():
-    assert TABS == ["Record", "Scenes", "Channels", "Council", "Learn", "Classify", "Evaluation", "Jobs", "Watcher", "Orbiters", "Transfer", "Validate", "Help"]
+    assert TABS == ["Live", "Sense Radar", "Council", "Capture", "Scenes", "Evaluation", "Watchers", "Orbiters", "Transfer", "Settings"]
 
 
 def test_tui_help_points_to_update_intelligence_action():
     assert "Council" in TABS
     assert any("Press u" in line for line in classifier_summary_lines(None, True))
+    footer = live_footer_text()
+    assert "m mark" in footer
+    assert "r record" in footer
+    assert "u update intelligence" in footer
+    assert "s snapshot" in footer
 
 
 def test_tab_index_delta_wraps_next_and_previous():
     assert tab_index_delta(0, 1) == 1
     assert tab_index_delta(len(TABS) - 1, 1) == 0
     assert tab_index_delta(0, -1) == len(TABS) - 1
+
+
+def test_live_rendering_handles_small_width():
+    lines = compact_live_observation_lines(None, 30)
+    full = live_observation_lines(None, 30)
+
+    assert lines
+    assert full
+    assert all(len(line) <= 30 for line in full)
 
 
 def test_wrap_text_handles_empty_and_long_notes():

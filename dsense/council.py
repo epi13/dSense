@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+from time import monotonic
 
 from .autotest import validate_dataset
 from .baseline import load_project_baseline, score_against_baseline, train_and_save_project_baseline
 from .classifier import load_project_classifier, predict_scene, train_and_save_project_classifier
 from .manifest import init_project, project_path
 from .models.evaluation import evaluate_project_scenes, evaluation_report_path
-from .orbiters import evaluate_project_orbiters, read_recent_orbiter_summaries
+from .orbiters import evaluate_project_orbiters, read_recent_orbiter_summaries, update_project_orbiters_incremental
 from .replay import read_preview_rows
 from .timeseries import (
     load_project_timeseries,
@@ -18,6 +19,7 @@ from .timeseries import (
 from .transfer import export_transfer_bundle, transfer_bundle_path
 from .utils.files import ensure_dir, read_json, write_json
 from .utils.timebase import utc_now_iso
+from .startup_progress import OPTIONAL_STARTUP_STEPS, make_progress, progress_warning
 from .watcher import read_recent_watcher_events, run_watcher_scan
 
 
@@ -36,6 +38,8 @@ def run_intelligence_update(
     run_orbiters: bool = True,
     run_training: bool = True,
     run_transfer: bool = True,
+    force_update: bool = False,
+    skip_steps: set[str] | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> dict[str, object]:
     state: dict[str, object] = {
@@ -66,51 +70,88 @@ def run_intelligence_update(
     models = state["models"]
     assert isinstance(models, dict)
 
-    def run_step(name: str, func: Callable[[], dict[str, object]]) -> dict[str, object]:
-        step = {"name": name, "status": "running", "started_utc": utc_now_iso(), "finished_utc": "", "summary": {}}
+    skip_steps = skip_steps or set()
+
+    def emit_progress(name: str, status: str, **kwargs) -> None:
+        _notify_progress(progress_callback, make_progress(name, status, **kwargs))
+
+    def run_step(name: str, func: Callable[[ProgressCallback | None], dict[str, object]]) -> dict[str, object]:
+        if name in skip_steps or (name in OPTIONAL_STARTUP_STEPS and f"skip:{name}" in skip_steps):
+            step = {"name": name, "status": "skipped", "started_utc": utc_now_iso(), "finished_utc": utc_now_iso(), "summary": {"message": "skipped by request"}}
+            state["steps"].append(step)
+            emit_progress(name, "skipped", progress=1.0, message="skipped by request")
+            return dict(step)
+        started_utc = utc_now_iso()
+        started = monotonic()
+        step = {"name": name, "status": "running", "started_utc": started_utc, "finished_utc": "", "summary": {}}
         state["steps"].append(step)
-        _notify(progress_callback, state, step)
+        emit_progress(name, "running", progress=None, message="starting", started_utc=started_utc)
+
+        def subprogress(update: dict[str, object]) -> None:
+            elapsed = monotonic() - started
+            emit_progress(
+                name,
+                "running",
+                progress=update.get("progress"),
+                current=update.get("current"),
+                total=update.get("total"),
+                message=str(update.get("message", "")),
+                started_utc=started_utc,
+                elapsed_s=elapsed,
+                warning=progress_warning(name, elapsed),
+            )
+
         try:
-            summary = func()
+            summary = func(subprogress)
             step["status"] = str(summary.pop("status", "ok"))
             step["summary"] = summary
         except Exception as exc:
             step["status"] = "failed"
             step["summary"] = {"error": str(exc)}
         step["finished_utc"] = utc_now_iso()
-        _notify(progress_callback, state, step)
+        elapsed = monotonic() - started
+        emit_progress(
+            name,
+            "failed" if step["status"] == "failed" else "skipped" if step["status"] == "skipped" else "done",
+            progress=1.0,
+            message=str(dict(step["summary"]).get("message") or dict(step["summary"]).get("skipped_reason") or dict(step["summary"]).get("path") or ""),
+            started_utc=started_utc,
+            finished_utc=str(step["finished_utc"]),
+            elapsed_s=elapsed,
+            error=str(dict(step["summary"]).get("error")) if step["status"] == "failed" else None,
+        )
         return dict(step)
 
-    run_step("init_project", lambda: {"path": str(init_project(project_name))})
-    run_step("validate", lambda: _validate_summary(project_name))
+    run_step("init_project", lambda progress: _init_summary(project_name, progress))
+    run_step("validate", lambda progress: _validate_summary(project_name, progress))
 
     if run_training:
-        run_step("train_baseline", lambda: _baseline_summary(train_and_save_project_baseline(project_name), models))
-        run_step("train_classifier", lambda: _classifier_summary(train_and_save_project_classifier(project_name), models))
-        run_step("train_timeseries", lambda: _timeseries_summary(train_and_save_project_timeseries(project_name), models))
+        run_step("train_baseline", lambda progress: _baseline_summary(train_and_save_project_baseline(project_name), models, progress))
+        run_step("train_classifier", lambda progress: _classifier_summary(train_and_save_project_classifier(project_name), models, progress))
+        run_step("train_timeseries", lambda progress: _timeseries_summary(train_and_save_project_timeseries(project_name), models, progress))
     else:
-        run_step("load_models", lambda: _load_model_summaries(project_name, models))
+        run_step("load_models", lambda progress: _load_model_summaries(project_name, models, progress))
 
-    run_step("evaluate", lambda: _evaluation_summary(evaluate_project_scenes(project_name), models))
+    run_step("evaluate", lambda progress: _evaluation_summary(evaluate_project_scenes(project_name), models, progress))
 
     if run_watchers:
-        run_step("watcher", lambda: _watcher_summary(run_watcher_scan(project_name, duration=0.05, tick_hz=20), project_name, models))
+        run_step("watcher", lambda progress: _watcher_summary(run_watcher_scan(project_name, duration=0.05, tick_hz=20), project_name, models, progress))
     else:
-        run_step("watcher", lambda: _watcher_existing_summary(project_name, models))
+        run_step("watcher", lambda progress: _watcher_existing_summary(project_name, models, progress))
 
     if run_orbiters:
-        run_step("orbiters", lambda: _orbiters_summary(evaluate_project_orbiters(project_name), project_name, models))
+        run_step("orbiters", lambda progress: _orbiters_summary(project_name, models, progress, startup=startup, force=force_update))
     else:
-        run_step("orbiters", lambda: _orbiters_existing_summary(project_name, models))
+        run_step("orbiters", lambda progress: _orbiters_existing_summary(project_name, models, progress))
 
     if run_transfer:
-        run_step("transfer", lambda: _transfer_summary(export_transfer_bundle(project_name), models))
+        run_step("transfer", lambda progress: _transfer_summary(export_transfer_bundle(project_name), models, progress))
     else:
-        run_step("transfer", lambda: _transfer_existing_summary(project_name, models))
+        run_step("transfer", lambda progress: _transfer_existing_summary(project_name, models, progress))
 
     state["council"] = build_council_summary(project_name, models)
     state["status"] = _overall_status(list(state["steps"]), dict(state["council"]))
-    run_step("write_state", lambda: _write_state_summary(project_name, state))
+    run_step("write_state", lambda progress: _write_state_summary(project_name, state, progress))
     state["status"] = _overall_status(list(state["steps"]), dict(state["council"]))
     write_json(intelligence_state_path(project_name), state)
     return state
@@ -233,7 +274,18 @@ def classify_with_council(project_name: str, scene_dir: Path) -> dict[str, objec
     }
 
 
-def _validate_summary(project_name: str) -> dict[str, object]:
+def _init_summary(project_name: str, progress: ProgressCallback | None = None) -> dict[str, object]:
+    if progress:
+        progress({"progress": 0.2, "message": "creating project directories"})
+    root = init_project(project_name)
+    if progress:
+        progress({"progress": 1.0, "message": str(root)})
+    return {"path": str(root)}
+
+
+def _validate_summary(project_name: str, progress: ProgressCallback | None = None) -> dict[str, object]:
+    if progress:
+        progress({"progress": None, "message": "checking scene metadata"})
     result = validate_dataset(project_name)
     return {
         "status": "warning" if result.error_count or result.warning_count else "ok",
@@ -244,25 +296,33 @@ def _validate_summary(project_name: str) -> dict[str, object]:
     }
 
 
-def _baseline_summary(model, models: dict[str, object]) -> dict[str, object]:
+def _baseline_summary(model, models: dict[str, object], progress: ProgressCallback | None = None) -> dict[str, object]:
+    if progress:
+        progress({"progress": 1.0, "current": model.scene_count, "total": model.scene_count, "message": f"trained {model.scene_count} baseline scenes"})
     summary = {"scene_count": model.scene_count, "channel_count": len(model.channels), "channels": sorted(model.channels)}
     models["baseline"] = summary
     return summary
 
 
-def _classifier_summary(model, models: dict[str, object]) -> dict[str, object]:
+def _classifier_summary(model, models: dict[str, object], progress: ProgressCallback | None = None) -> dict[str, object]:
+    if progress:
+        progress({"progress": 1.0, "current": model.scene_count, "total": model.scene_count, "message": f"trained {model.scene_count} scenes"})
     summary = {"scene_count": model.scene_count, "baseline_scene_count": model.baseline_scene_count, "label_counts": model.label_counts}
     models["classifier"] = summary
     return summary
 
 
-def _timeseries_summary(model, models: dict[str, object]) -> dict[str, object]:
+def _timeseries_summary(model, models: dict[str, object], progress: ProgressCallback | None = None) -> dict[str, object]:
+    if progress:
+        progress({"progress": 1.0, "current": model.scene_count, "total": model.scene_count, "message": f"trained {model.scene_count} temporal profiles"})
     summary = {"scene_count": model.scene_count, "label_counts": model.label_counts, "sequence_channels": model.sequence_channels}
     models["timeseries"] = summary
     return summary
 
 
-def _load_model_summaries(project_name: str, models: dict[str, object]) -> dict[str, object]:
+def _load_model_summaries(project_name: str, models: dict[str, object], progress: ProgressCallback | None = None) -> dict[str, object]:
+    if progress:
+        progress({"progress": 0.2, "message": "loading existing artifacts"})
     baseline = load_project_baseline(project_name)
     classifier = load_project_classifier(project_name)
     timeseries = load_project_timeseries(project_name)
@@ -272,10 +332,14 @@ def _load_model_summaries(project_name: str, models: dict[str, object]) -> dict[
         models["classifier"] = {"scene_count": classifier.scene_count, "baseline_scene_count": classifier.baseline_scene_count, "label_counts": classifier.label_counts}
     if timeseries is not None:
         models["timeseries"] = {"scene_count": timeseries.scene_count, "label_counts": timeseries.label_counts, "sequence_channels": timeseries.sequence_channels}
+    if progress:
+        progress({"progress": 1.0, "message": "existing artifacts loaded"})
     return {"loaded": True}
 
 
-def _evaluation_summary(report: dict[str, object], models: dict[str, object]) -> dict[str, object]:
+def _evaluation_summary(report: dict[str, object], models: dict[str, object], progress: ProgressCallback | None = None) -> dict[str, object]:
+    if progress:
+        progress({"progress": 1.0, "current": report.get("scene_count", 0), "total": report.get("scene_count", 0), "message": "evaluation report written"})
     summary = {
         "path": str(evaluation_report_path(str(report.get("project_name", "")))),
         "scene_count": report.get("scene_count", 0),
@@ -288,7 +352,7 @@ def _evaluation_summary(report: dict[str, object], models: dict[str, object]) ->
     return summary
 
 
-def _watcher_summary(result: dict[str, object], project_name: str, models: dict[str, object]) -> dict[str, object]:
+def _watcher_summary(result: dict[str, object], project_name: str, models: dict[str, object], progress: ProgressCallback | None = None) -> dict[str, object]:
     events = read_recent_watcher_events(project_name, 10)
     summary = {
         "event_count": len(events),
@@ -297,47 +361,66 @@ def _watcher_summary(result: dict[str, object], project_name: str, models: dict[
         "path": result.get("watcher_events_path", ""),
     }
     models["watcher"] = summary
+    if progress:
+        progress({"progress": 1.0, "current": len(events), "total": len(events), "message": "watcher refresh complete"})
     return summary
 
 
-def _watcher_existing_summary(project_name: str, models: dict[str, object]) -> dict[str, object]:
+def _watcher_existing_summary(project_name: str, models: dict[str, object], progress: ProgressCallback | None = None) -> dict[str, object]:
     events = read_recent_watcher_events(project_name, 10)
     summary = {"status": "skipped", "event_count": len(events), "recent_events": events}
     models["watcher"] = summary
+    if progress:
+        progress({"progress": 1.0, "message": "skipped: disabled"})
     return summary
 
 
-def _orbiters_summary(report: dict[str, object], project_name: str, models: dict[str, object]) -> dict[str, object]:
+def _orbiters_summary(project_name: str, models: dict[str, object], progress: ProgressCallback | None = None, *, startup: bool = False, force: bool = False) -> dict[str, object]:
+    if startup:
+        report = update_project_orbiters_incremental(project_name, force=force, enrich=False, progress_callback=progress)
+        summaries = read_recent_orbiter_summaries(project_path(project_name), 10)
+        summary = {"status": report.get("status", "ok"), "processed_events": report.get("processed_events", 0), "summary_count": len(summaries), "recent_summaries": summaries, "message": report.get("skipped_reason") or "incremental orbiters updated"}
+        models["orbiters"] = summary
+        return summary
+    report = evaluate_project_orbiters(project_name)
     summaries = read_recent_orbiter_summaries(project_path(project_name), 10)
     summary = {"evaluated": report.get("evaluated", 0), "accuracy": report.get("accuracy", 0.0), "summary_count": len(summaries), "recent_summaries": summaries}
     models["orbiters"] = summary
     return summary
 
 
-def _orbiters_existing_summary(project_name: str, models: dict[str, object]) -> dict[str, object]:
+def _orbiters_existing_summary(project_name: str, models: dict[str, object], progress: ProgressCallback | None = None) -> dict[str, object]:
     summaries = read_recent_orbiter_summaries(project_path(project_name), 10)
     summary = {"status": "skipped", "summary_count": len(summaries), "recent_summaries": summaries}
     models["orbiters"] = summary
+    if progress:
+        progress({"progress": 1.0, "message": "skipped: disabled"})
     return summary
 
 
-def _transfer_summary(bundle: dict[str, object], models: dict[str, object]) -> dict[str, object]:
+def _transfer_summary(bundle: dict[str, object], models: dict[str, object], progress: ProgressCallback | None = None) -> dict[str, object]:
     summary = {"path": str(transfer_bundle_path(str(bundle.get("project_name", "")))), "total_scenes": bundle.get("total_scenes", 0), "scene_counts": bundle.get("scene_counts", {})}
     models["transfer"] = summary
+    if progress:
+        progress({"progress": 1.0, "current": bundle.get("total_scenes", 0), "total": bundle.get("total_scenes", 0), "message": "transfer bundle written"})
     return summary
 
 
-def _transfer_existing_summary(project_name: str, models: dict[str, object]) -> dict[str, object]:
+def _transfer_existing_summary(project_name: str, models: dict[str, object], progress: ProgressCallback | None = None) -> dict[str, object]:
     path = transfer_bundle_path(project_name)
     summary: dict[str, object] = {"status": "skipped", "path": str(path), "exists": path.exists()}
     models["transfer"] = summary
+    if progress:
+        progress({"progress": 1.0, "message": "skipped: disabled"})
     return summary
 
 
-def _write_state_summary(project_name: str, state: dict[str, object]) -> dict[str, object]:
+def _write_state_summary(project_name: str, state: dict[str, object], progress: ProgressCallback | None = None) -> dict[str, object]:
     path = intelligence_state_path(project_name)
     ensure_dir(path.parent)
     write_json(path, state)
+    if progress:
+        progress({"progress": 1.0, "message": str(path)})
     return {"path": str(path)}
 
 
@@ -376,9 +459,9 @@ def _readiness_agreement(baseline_count: int, classifier_count: int, timeseries_
     return "low"
 
 
-def _notify(callback: ProgressCallback | None, state: dict[str, object], step: dict[str, object]) -> None:
+def _notify_progress(callback: ProgressCallback | None, event: dict[str, object]) -> None:
     if callback is not None:
-        callback({"state": state, "step": dict(step)})
+        callback(event)
 
 
 def _unique(values: list[str]) -> list[str]:

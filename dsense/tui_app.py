@@ -11,7 +11,7 @@ from .tui_state import AppState, CaptureConfig
 
 def run_tui(config: CaptureConfig) -> list[dict[str, object]]:
     backend = os.environ.get("DSENSE_TUI_BACKEND", "auto").strip().lower()
-    startup_visible_in_curses = config.startup_intelligence or config.auto_baseline_policy != "off" or config.startup_suite_enabled
+    startup_visible_in_curses = config.live or config.start_tab in {"live", "sense-radar", "capture"} or config.startup_intelligence or config.auto_baseline_policy != "off" or config.startup_suite_enabled
     if startup_visible_in_curses and backend != "textual":
         return _run_curses_tui(config)
     if backend != "curses" and _textual_available():

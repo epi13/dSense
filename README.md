@@ -157,9 +157,9 @@ python -m dsense tui base
 
 Channel groups keep dSense portable by default. `portable` is the default group. `linux` adds optional `/proc` and thermal/sysfs adapters when readable. `experimental` currently reports the eBPF adapter as unavailable unless a future implementation is installed. Use `dsense scan --advanced` to see group and permission status, and `dsense scene base --channels portable,linux ...` to opt into Linux telemetry for a capture. The optional network latency channel is disabled unless `DSENSE_NET_HOST` is set; it performs TCP connect timing and can perturb measurements, so use it deliberately.
 
-## TUI interaction recorder
+## Live Observatory
 
-Use `python -m dsense` or `python -m dsense tui` for the full-screen recorder. By default it opens the base project at `datasets/base/`, loads all existing scenes from that project, and stores new captures there. To use another project, pass it explicitly, for example `python -m dsense tui demo_lab`.
+Use `python -m dsense`, `python -m dsense tui`, or `python -m dsense live base` for the full-screen local observatory. By default it opens the base project at `datasets/base/`, refreshes the local intelligence stack when enabled, and then opens directly to `LIVE OBSERVATORY`. To use another project, pass it explicitly, for example `python -m dsense tui demo_lab`.
 
 The TUI is Linux/Unix-first because it depends on terminal curses behavior. Non-TUI commands such as `doctor`, `scan`, `init`, `record-baseline`, `scene`, `validate`, and export commands are intended to remain portable where the underlying channel adapters are available.
 
@@ -170,6 +170,7 @@ To open the TUI without startup training, watcher scans, orbiters, or baseline-s
 ```bash
 dsense tui base --no-startup-intelligence
 dsense tui-safe base
+dsense live base --no-startup-intelligence
 ```
 
 Granular startup controls:
@@ -185,11 +186,31 @@ dsense tui base --no-startup-suite
 dsense tui base --no-startup-watchers
 dsense tui base --no-startup-orbiters
 dsense tui base --no-startup-training
+dsense tui base --fast-start
+dsense tui-fast base
+dsense tui base --force-startup-update
 dsense tui base --startup-suite-target 200
 dsense tui base --startup-suite-duration 0.2
+dsense tui base --start-tab live
+dsense tui base --start-tab capture
 ```
 
-The TUI opens as a tabbed local control panel. The tab bar includes `Record`, `Scenes`, `Channels`, `Council`, `Learn`, `Classify`, `Evaluation`, `Watcher`, `Orbiters`, `Transfer`, `Validate`, and `Help`. The `Record` tab keeps the editable capture setup with preset groups for `user`, `baseline`, and `activity` scenes. `Scenes` lets you browse recorded scenes and inspect wrapped scene notes. `Channels` shows adapter status. `Council` shows coordinated local evidence, model agreement, confidence, warnings, and recommendations. `Learn` and `Classify` show local model state. `Watcher`, `Orbiters`, `Transfer`, and `Validate` expose project artifacts without leaving the terminal.
+The startup screen shows each intelligence step with status, progress when known, an activity spinner when progress is unknown, elapsed time, and the current subtask. Optional startup steps such as watchers, orbiters, and transfer can be skipped from the startup screen with `s`. `--fast-start` opens quickly with existing artifacts and skips expensive startup work. `--force-startup-update` ignores current-state checks where supported.
+
+The TUI opens as a tabbed local control panel. The tab bar includes `Live`, `Sense Radar`, `Council`, `Capture`, `Scenes`, `Evaluation`, `Watchers`, `Orbiters`, `Transfer`, and `Settings`. `Live` shows current telemetry, model agreement, known anomalies, unknown anomalies, and cautious recommendations. `Sense Radar` is an experimental anomaly visualization. `Council` shows coordinated local evidence, model agreement, confidence, warnings, and recommendations. `Capture` keeps the existing scene recorder with preset groups for `user`, `baseline`, and `activity` scenes. `Scenes` lets you browse recorded scenes and inspect wrapped scene notes.
+
+The Sense Radar is not literal radar and does not prove biological presence. It visualizes local timing/system-signal disturbances and compares them against trained scene labels. If you train directional walking scenes, dSense can display weak directional hypotheses, but those hypotheses require repeated validation.
+
+Known anomalies are patterns that match trained labels or known watcher event types, such as timing spikes, baseline drift, disk or CPU disturbance, or a trained scene label. Unknown anomalies are elevated disturbance patterns without a confident match: low classifier confidence, low time-series confidence, high baseline distance, watcher score elevation, high channel volatility, or council disagreement.
+
+Live View hotkeys:
+
+- `m` marks the current live interval in `datasets/<project>/events/live_session.jsonl`
+- `r` routes to `Capture` with the current anomaly context prefilled
+- `u` updates the full local intelligence stack
+- `s` saves `datasets/<project>/exports/live_snapshot_<timestamp>.json`
+- `TAB` switches tabs
+- `q` exits
 
 Press `u` from the TUI setup screen to run **Update Intelligence** again. This is the primary manual update path and refreshes validation, baseline, classifier, time-series, evaluation, watcher/orbiter context, transfer, and Council state. Focused commands such as validation and export remain available, but the main workflow is one comprehensive local update rather than separate model operations.
 
@@ -202,6 +223,8 @@ python -m dsense train-timeseries --require-valid
 python -m dsense update-intelligence base
 python -m dsense council-status base
 ```
+
+`update-intelligence` prints terminal progress for each step. Use `--json` to print the final state as JSON, or `--force` to refresh cacheable startup artifacts such as incremental orbiters.
 
 ### Intelligence Council and time-series model
 
@@ -240,23 +263,27 @@ Recommended repeatability set:
 - `walk_by`
 - optional controls: `cpu_load_no_person`, `door_open_close`
 
-On the setup screen:
+In the Live Observatory:
 
 - `TAB` switches to the next tab
 - `Shift+TAB` or left arrow switches to the previous tab
-- `1`-`0` jumps directly to tabs from `Record` through `Help`
+- `1`-`0` jumps directly to tabs from `Live` through `Settings`
+- `m` marks the current interval
+- `r` opens `Capture` with the current disturbance context
+- `u` updates the full local intelligence stack
+- `s` saves a live snapshot
+- `q` exits the TUI
+
+On the `Capture` tab:
+
 - `m` cycles scene mode: user interactions, baseline system scenes, and system activity scenes
 - `p` / `o` cycles presets inside the current mode
 - `g` toggles batch recording for the whole current preset group
 - `a` toggles automatic heuristic event detection
-- `u` updates the full local intelligence stack
-- `v` validates the project and summarizes health
-- `e` exports a local transfer bundle
 - `Enter` edits the selected field or cycles mode/preset/toggle fields
-- `c` starts recording from the `Record` tab
-- `q` exits the TUI from the setup screen
+- `c` starts recording
 
-The `Help` tab summarizes the recommended workflow, scene-mode meanings, and the pre-roll/action/post-roll timing model. dSense remains a local substrate-signal capture tool; labels and summaries are evidence for controlled experiments, not claims of external certainty.
+dSense remains a local substrate-signal capture tool; labels and summaries are evidence for controlled experiments, not claims of external certainty.
 
 During recording:
 
@@ -266,7 +293,7 @@ During recording:
 - `n` writes a `noise_marker`
 - `q` writes a `review_flag`
 
-The live view shows the total event count, automatic/manual marker counts, a signal watcher meter, an event rail, and the newest recorded events. The event rail uses `S/A/E/X` for scheduled system events, `!` for heuristic signal events, and `*` for manual markers. Markers are saved to `events.jsonl` alongside `scene_start`, `action_start`, `action_end`, and `scene_end`. After each take, the TUI shows quality and frame counts and lets you keep, retake, or discard the recording. When a recording session completes, any key returns to the setup screen with the refreshed scene list. Existing scripted flows remain available through `record-baseline` and `scene`; `scene --tui` opens the same full-screen recorder using the scene command's arguments.
+The recording view shows the total event count, automatic/manual marker counts, a signal watcher meter, an event rail, and the newest recorded events. The event rail uses `S/A/E/X` for scheduled system events, `!` for heuristic signal events, and `*` for manual markers. Markers are saved to `events.jsonl` alongside `scene_start`, `action_start`, `action_end`, and `scene_end`. After each take, the TUI shows quality and frame counts and lets you keep, retake, or discard the recording. When a recording session completes, any key returns to the Live Observatory with the refreshed scene list. Existing scripted flows remain available through `record-baseline` and `scene`; `scene --tui` opens the same full-screen recorder using the scene command's arguments.
 
 Watcher scans save candidate scenes and append `watcher/events.jsonl`. Rolling watcher mode keeps recent frames in memory and only saves a pre/post anomaly window when the detector triggers:
 

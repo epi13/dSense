@@ -266,6 +266,12 @@ def cmd_tui(args):
         args.no_startup_orbiters = True
         args.no_startup_training = True
         print("Startup intelligence disabled for this session.")
+    if args.fast_start:
+        args.no_startup_watchers = True
+        args.no_startup_orbiters = True
+        args.no_startup_training = True
+        args.no_startup_suite = True
+        print("Fast start: loading existing artifacts and skipping expensive startup work.")
     print("Opening TUI startup pipeline..." if startup_intelligence else "Opening TUI without startup intelligence...")
     duration = _validated_duration(args.duration, args.pre_roll, args.action, args.post_roll)
     _validate_repeat_tick(args.repeat, args.tick_hz)
@@ -292,6 +298,10 @@ def cmd_tui(args):
         startup_watchers=not args.no_startup_watchers,
         startup_orbiters=not args.no_startup_orbiters,
         startup_training=not args.no_startup_training,
+        live=args.live,
+        start_tab=args.start_tab,
+        fast_start=args.fast_start,
+        force_startup_update=args.force_startup_update,
     )
 
 
@@ -302,6 +312,17 @@ def cmd_tui_safe(args):
     args.no_startup_training = True
     args.no_auto_baseline = True
     args.no_startup_suite = True
+    cmd_tui(args)
+
+
+def cmd_live(args):
+    args.live = True
+    args.start_tab = "live"
+    cmd_tui(args)
+
+
+def cmd_tui_fast(args):
+    args.fast_start = True
     cmd_tui(args)
 
 
@@ -390,15 +411,32 @@ def cmd_train_timeseries(args):
 def cmd_update_intelligence(args):
     project_name = args.project_name or DEFAULT_PROJECT
     init_project(project_name)
-    print(f"Updating local intelligence stack: {project_name}", flush=True)
+    if not args.json:
+        print(f"Updating local intelligence stack: {project_name}", flush=True)
+    step_order = ["init_project", "validate", "train_baseline" if not args.no_training else "load_models", "train_classifier", "train_timeseries", "evaluate", "watcher", "orbiters", "transfer", "write_state"]
+    seen_done: set[str] = set()
 
     def progress(update: dict[str, object]) -> None:
-        step = dict(update.get("step", {}))
-        status = str(step.get("status", ""))
-        name = str(step.get("name", ""))
-        summary = dict(step.get("summary", {})) if isinstance(step.get("summary"), dict) else {}
-        detail = summary.get("error") or summary.get("path") or summary.get("scene_count") or ""
-        print(f"  {name}: {status}{f' ({detail})' if detail != '' else ''}", flush=True)
+        if args.json:
+            return
+        name = str(update.get("name", ""))
+        status = str(update.get("status", ""))
+        if status == "running" and name in seen_done:
+            return
+        if status in {"done", "failed", "skipped"}:
+            seen_done.add(name)
+        total = len(step_order)
+        index = step_order.index(name) + 1 if name in step_order else len(seen_done)
+        count = ""
+        if update.get("current") is not None and update.get("total") is not None:
+            count = f" {update.get('current')}/{update.get('total')}"
+        message = str(update.get("error") or update.get("message") or "")
+        label = str(update.get("label", name))
+        if status == "running":
+            print(f"[{index}/{total}] {label}...{count} {message}".rstrip(), flush=True)
+        else:
+            suffix = f": {message}" if message else ""
+            print(f"[{index}/{total}] {label}... {status}{suffix}", flush=True)
 
     state = run_intelligence_update(
         project_name,
@@ -407,8 +445,12 @@ def cmd_update_intelligence(args):
         run_orbiters=not args.no_orbiters,
         run_training=not args.no_training,
         run_transfer=not args.no_transfer,
+        force_update=args.force,
         progress_callback=progress,
     )
+    if args.json:
+        print(json.dumps(state, indent=2, sort_keys=True))
+        return
     council = dict(state.get("council", {}))
     print(f"Status: {state.get('status')}")
     print(f"Agreement: {council.get('agreement')}  confidence={council.get('overall_confidence')}")
@@ -676,6 +718,10 @@ def _add_tui_args(sp):
     sp.add_argument("--no-startup-watchers", action="store_true", help="skip startup watcher scan inside the intelligence update")
     sp.add_argument("--no-startup-orbiters", action="store_true", help="skip startup orbiter evaluation inside the intelligence update")
     sp.add_argument("--no-startup-training", action="store_true", help="load existing models instead of retraining during startup intelligence")
+    sp.add_argument("--live", action="store_true", default=True, help="open to the Live Observatory view")
+    sp.add_argument("--start-tab", choices=["live", "sense-radar", "council", "capture", "scenes", "evaluation", "watchers", "orbiters", "transfer", "settings"], default="live", help="initial TUI tab")
+    sp.add_argument("--fast-start", action="store_true", help="open quickly using existing artifacts; skips watcher, orbiter, training, and startup suite work")
+    sp.add_argument("--force-startup-update", action="store_true", help="ignore startup cache checks and regenerate startup artifacts where supported")
 
 
 def build_parser():
@@ -714,6 +760,8 @@ def build_parser():
     sp = sub.add_parser("scene"); sp.add_argument("project_name"); sp.add_argument("--label", required=True); sp.add_argument("--duration", type=float); sp.add_argument("--pre-roll", type=float, default=2); sp.add_argument("--action", type=float, default=5); sp.add_argument("--post-roll", type=float, default=3); sp.add_argument("--repeat", type=int, default=1); sp.add_argument("--notes", default=""); sp.add_argument("--tick-hz", type=int, default=100); sp.add_argument("--channels", default="portable", help="channel groups, e.g. portable or portable,linux"); sp.add_argument("--yes", action="store_true", help="accept captures without prompt"); sp.add_argument("--tui", action="store_true", help="record with the full-screen interaction recorder"); sp.set_defaults(func=cmd_scene)
     sp = sub.add_parser("tui"); _add_tui_args(sp); sp.set_defaults(func=cmd_tui)
     sp = sub.add_parser("tui-safe", help="open the TUI without startup intelligence, watchers, orbiters, training, or baseline-suite work"); _add_tui_args(sp); sp.set_defaults(func=cmd_tui_safe)
+    sp = sub.add_parser("tui-fast", help="open the TUI with fast-start settings"); _add_tui_args(sp); sp.set_defaults(func=cmd_tui_fast)
+    sp = sub.add_parser("live", help="open the TUI directly to Live Observatory"); _add_tui_args(sp); sp.set_defaults(func=cmd_live)
     sp = sub.add_parser("list-scenes"); sp.add_argument("project_name"); sp.set_defaults(func=cmd_list)
     sp = sub.add_parser("export-preview"); sp.add_argument("project_name"); sp.set_defaults(func=cmd_export)
     sp = sub.add_parser("validate"); sp.add_argument("project_name"); sp.add_argument("--verbose", "-v", action="store_true", help="show detailed error messages"); sp.set_defaults(func=cmd_validate)
@@ -721,7 +769,7 @@ def build_parser():
     sp.add_argument("--require-valid", action="store_true", help="fail before training if dataset validation has errors")
     sp = sub.add_parser("train-classifier"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to train (default: {DEFAULT_PROJECT})"); sp.add_argument("--require-valid", action="store_true", help="fail before training if dataset validation has errors"); sp.set_defaults(func=cmd_train_classifier)
     sp = sub.add_parser("train-timeseries"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to train (default: {DEFAULT_PROJECT})"); sp.add_argument("--require-valid", action="store_true", help="fail before training if dataset validation has errors"); sp.set_defaults(func=cmd_train_timeseries)
-    sp = sub.add_parser("update-intelligence"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to update (default: {DEFAULT_PROJECT})"); sp.add_argument("--no-watchers", action="store_true", help="skip watcher scan and use existing watcher events"); sp.add_argument("--no-orbiters", action="store_true", help="skip orbiter evaluation and use existing summaries"); sp.add_argument("--no-training", action="store_true", help="load existing models instead of retraining"); sp.add_argument("--no-transfer", action="store_true", help="skip transfer bundle export"); sp.set_defaults(func=cmd_update_intelligence)
+    sp = sub.add_parser("update-intelligence"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to update (default: {DEFAULT_PROJECT})"); sp.add_argument("--no-watchers", action="store_true", help="skip watcher scan and use existing watcher events"); sp.add_argument("--no-orbiters", action="store_true", help="skip orbiter evaluation and use existing summaries"); sp.add_argument("--no-training", action="store_true", help="load existing models instead of retraining"); sp.add_argument("--no-transfer", action="store_true", help="skip transfer bundle export"); sp.add_argument("--force", action="store_true", help="ignore cache/current-state checks where supported"); sp.add_argument("--json", action="store_true", help="print final intelligence state as JSON"); sp.set_defaults(func=cmd_update_intelligence)
     sp = sub.add_parser("council-status"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to inspect (default: {DEFAULT_PROJECT})"); sp.set_defaults(func=cmd_council_status)
     sp = sub.add_parser("export-transfer"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to export (default: {DEFAULT_PROJECT})"); sp.add_argument("--require-valid", action="store_true", help="fail before export if dataset validation has errors"); sp.add_argument("--redact", action="store_true", help="write a privacy-redacted safe transfer bundle"); sp.set_defaults(func=cmd_export_transfer)
     sp = sub.add_parser("privacy-report"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to inspect (default: {DEFAULT_PROJECT})"); sp.add_argument("--out", help="write privacy report JSON to this path"); sp.set_defaults(func=cmd_privacy_report)

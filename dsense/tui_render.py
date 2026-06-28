@@ -5,7 +5,7 @@ import textwrap
 from .classifier import SceneClassifierModel
 
 
-TABS = ["Record", "Scenes", "Channels", "Council", "Learn", "Classify", "Evaluation", "Jobs", "Watcher", "Orbiters", "Transfer", "Validate", "Help"]
+TABS = ["Live", "Sense Radar", "Council", "Capture", "Scenes", "Evaluation", "Watchers", "Orbiters", "Transfer", "Settings"]
 MIN_TUI_HEIGHT = 18
 MIN_TUI_WIDTH = 60
 SPARKLINE_LEVELS = "▁▂▃▄▅▆▇█"
@@ -209,6 +209,127 @@ def council_summary_lines(state: dict[str, object] | None, limit: int = 8) -> li
         lines.append("Recommendations:")
         lines.extend(f"  - {item}" for item in recommendations)
     return lines
+
+
+LIVE_FOOTER = "m mark | r record | u update intelligence | s snapshot | tab tabs | q quit"
+
+
+def live_footer_text() -> str:
+    return LIVE_FOOTER
+
+
+def live_observation_lines(observation: object | None, width: int = 80) -> list[str]:
+    if observation is None:
+        return [clip_text(line, width) for line in ["LIVE OBSERVATORY", "waiting for local telemetry...", LIVE_FOOTER]]
+    data = observation.to_dict() if hasattr(observation, "to_dict") else dict(observation)
+    values = dict(data.get("channel_values", {}))
+    status = dict(data.get("channel_status", {}))
+    known = list(data.get("known_anomalies", []))
+    unknown = list(data.get("unknown_anomalies", []))
+    proximity = dict(data.get("proximity_hypothesis", {}))
+    rate = _rate_from_elapsed(data)
+    lines = [
+        f"dSense LIVE OBSERVATORY - project: {data.get('project_name', '?')}       tick: {int(data.get('tick', 0)):06d}       rate: {rate}",
+        "",
+        "Telemetry",
+        _telemetry_strip(values, status, width),
+        "",
+        "Sense Radar",
+        *sense_radar_lines(proximity, data.get("council_agreement", "unknown"), width),
+        "",
+        "Intelligence Council",
+        compact_live_council_line(data, width),
+        "",
+        "Known Anomalies",
+        *anomaly_lines(known, none_text="none", width=width),
+        "",
+        "Unknown Anomalies",
+        *anomaly_lines(unknown, none_text="none", width=width),
+        "",
+        LIVE_FOOTER,
+    ]
+    return [clip_text(line, width) for line in lines]
+
+
+def compact_live_observation_lines(observation: object | None, width: int = 80) -> list[str]:
+    if observation is None:
+        return ["LIVE OBSERVATORY", "waiting for telemetry", LIVE_FOOTER]
+    data = observation.to_dict() if hasattr(observation, "to_dict") else dict(observation)
+    unknown = list(data.get("unknown_anomalies", []))
+    known = list(data.get("known_anomalies", []))
+    top = unknown[:1] or known[:1]
+    anomaly = "none" if not top else f"{dict(top[0]).get('name', 'pattern')} score {_fmt_float(dict(top[0]).get('score'), 2)}"
+    return [
+        f"LIVE OBSERVATORY {data.get('project_name', '?')} tick {int(data.get('tick', 0)):06d}",
+        compact_live_council_line(data, width),
+        f"Top anomaly: {anomaly}",
+        LIVE_FOOTER,
+    ]
+
+
+def compact_live_council_line(data: dict[str, object], width: int = 80) -> str:
+    baseline_score = _fmt_float(data.get("baseline_score"), 2)
+    watcher_score = _fmt_float(data.get("watcher_score"), 2)
+    classifier_label = data.get("classifier_label", "unknown")
+    classifier_conf = _fmt_float(data.get("classifier_confidence"), 2)
+    timeseries_label = data.get("timeseries_label", "unknown")
+    timeseries_conf = _fmt_float(data.get("timeseries_confidence"), 2)
+    agreement = data.get("council_agreement", "unknown")
+    council_conf = _fmt_float(data.get("council_confidence"), 2)
+    return clip_text(
+        f"baseline: {baseline_score} | classifier: {classifier_label} {classifier_conf} | "
+        f"timeseries: {timeseries_label} {timeseries_conf} | watcher: {watcher_score} | "
+        f"agreement: {agreement} | confidence: {council_conf}",
+        width,
+    )
+
+
+def sense_radar_lines(proximity: dict[str, object], agreement: object = "unknown", width: int = 80) -> list[str]:
+    strength = _fmt_float(proximity.get("strength"), 2)
+    direction = str(proximity.get("direction", "unknown"))
+    status = str(proximity.get("status", "normal"))
+    label_hint = proximity.get("label_hint") or "none"
+    confidence = _fmt_float(proximity.get("confidence"), 2)
+    radar = [
+        "                 N",
+        "             .   |   .",
+        "        W -------+------- E",
+        "             .   |   .",
+        "                 S",
+        f"strength: {strength}   direction: {direction}   status: {status}",
+        f"known match: {label_hint}   confidence: {confidence}",
+        f"council: {agreement}   status: needs validation",
+    ]
+    return [clip_text(line, width) for line in radar]
+
+
+def anomaly_lines(rows: list[object], none_text: str, width: int = 80) -> list[str]:
+    if not rows:
+        return [none_text]
+    lines = []
+    for row in rows[:5]:
+        item = dict(row)
+        action = f"   action: {item.get('action')}" if item.get("action") else ""
+        lines.append(clip_text(f"{item.get('name', 'pattern'):<24} score {_fmt_float(item.get('score'), 2)}   {item.get('detail', '')}{action}", width))
+    return lines
+
+
+def _telemetry_strip(values: dict[str, object], status: dict[str, object], width: int) -> str:
+    if not values:
+        return "no live numeric channels yet"
+    parts = []
+    for key in sorted(values)[:8]:
+        label = value_channel_id(key)
+        parts.append(f"{label}: {status.get(key, 'ok')}")
+    return clip_text("   ".join(parts), width)
+
+
+def _rate_from_elapsed(data: dict[str, object]) -> str:
+    tick = int(data.get("tick", 0) or 0)
+    elapsed = float(data.get("elapsed_s", 0.0) or 0.0)
+    if elapsed <= 0:
+        return "0.0 Hz"
+    return f"{tick / elapsed:0.1f} Hz"
 
 
 def _fmt_float(value: object, digits: int = 2) -> str:
