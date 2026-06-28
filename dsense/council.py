@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from pathlib import Path
 from time import monotonic
@@ -11,6 +12,7 @@ from .manifest import init_project, project_path
 from .models.evaluation import evaluate_project_scenes, evaluation_report_path
 from .orbiters import evaluate_project_orbiters, read_recent_orbiter_summaries, update_project_orbiters_incremental
 from .replay import read_preview_rows
+from .scenarios import all_scenarios
 from .timeseries import (
     load_project_timeseries,
     predict_scene_timeseries,
@@ -185,15 +187,22 @@ def build_council_summary(project_name: str, models: dict[str, object] | None = 
     classifier_count = int(classifier.get("scene_count", 0) or 0)
     timeseries_count = int(timeseries.get("scene_count", 0) or 0)
     label_counts = {str(k): int(v) for k, v in dict(classifier.get("label_counts", timeseries.get("label_counts", {}))).items()}
+    grouped_label_counts = _repeatability_label_counts(label_counts)
 
     if baseline_count < 3:
         warnings.append("not enough baseline scenes")
         recommendations.append("record 3 more baseline takes or run baseline-suite to increase negative controls")
-    repeated_short = sorted(label for label, count in label_counts.items() if count < 2)
-    if repeated_short:
-        weak_labels.extend(repeated_short)
+    repeated_short = sorted(label for label, count in grouped_label_counts.items() if count < 2)
+    manual_short = [label for label in repeated_short if _label_capture_kind(label) == "manual"]
+    auto_short = [label for label in repeated_short if _label_capture_kind(label) == "auto"]
+    if manual_short:
+        weak_labels.extend(manual_short)
         warnings.append("not enough repeated user labels")
-        recommendations.extend(f"record 3 more takes of label {label}" for label in repeated_short[:5])
+        recommendations.extend(f"record 3 more takes of label family {label}" for label in manual_short[:5])
+    if auto_short:
+        weak_labels.extend(auto_short)
+        warnings.append("not enough repeated automatic control labels")
+        recommendations.extend(_auto_scene_recommendation(project_name, label) for label in auto_short[:5])
     if not watcher.get("event_count"):
         warnings.append("no watcher events available")
     if not orbiters.get("summary_count"):
@@ -217,7 +226,7 @@ def build_council_summary(project_name: str, models: dict[str, object] | None = 
     if not best_channels:
         recommendations.append("enable linux channels for richer telemetry if available")
 
-    agreement = _readiness_agreement(baseline_count, classifier_count, timeseries_count, label_counts)
+    agreement = _readiness_agreement(baseline_count, classifier_count, timeseries_count, grouped_label_counts)
     readiness = [
         min(1.0, baseline_count / 6.0),
         min(1.0, classifier_count / 8.0),
@@ -457,6 +466,81 @@ def _readiness_agreement(baseline_count: int, classifier_count: int, timeseries_
     if baseline_count >= 1 and repeated >= 1:
         return "medium"
     return "low"
+
+
+def _repeatability_label_counts(label_counts: dict[str, int]) -> dict[str, int]:
+    grouped: dict[str, int] = {}
+    for label, count in label_counts.items():
+        if _is_baseline_label(label):
+            continue
+        family = _label_family(label)
+        grouped[family] = grouped.get(family, 0) + int(count)
+    return grouped
+
+
+def _label_family(label: str) -> str:
+    normalized = _normalize_label(label)
+    for prefix in ("user_", "person_"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix) :]
+    tokens = [token for token in normalized.split("_") if token]
+    if not tokens:
+        return "unknown"
+    if "approach" in tokens or "approaches" in tokens:
+        return "approach"
+    if "typing" in tokens or "keyboard" in tokens:
+        return "typing"
+    if "mouse" in tokens:
+        return "mouse_activity"
+    if "phone" in tokens:
+        return "phone_near"
+    if "door" in tokens:
+        return "door_open_close"
+    if "table" in tokens and "tap" in tokens:
+        return "table_tap"
+    if "stand" in tokens or "stationary" in tokens:
+        return "stand_near"
+    if "sit" in tokens:
+        return "sit_down"
+    if "leave" in tokens or "depart" in tokens or "departs" in tokens:
+        return "leave"
+    if "walk" in tokens or "walks" in tokens:
+        direction_tokens = {"left", "right", "front", "behind", "to"}
+        direction = [token for token in tokens if token in direction_tokens]
+        return "walk_" + "_".join(direction) if direction else "walk"
+    return normalized
+
+
+def _label_capture_kind(label: str) -> str:
+    normalized = _normalize_label(label)
+    if normalized.startswith("activity_"):
+        return "auto"
+    scenario = _scenario_by_normalized_label(normalized)
+    if scenario is not None:
+        return "auto" if scenario.automatable else "manual"
+    return "manual"
+
+
+def _auto_scene_recommendation(project_name: str, label: str) -> str:
+    scenario = _scenario_by_normalized_label(_normalize_label(label))
+    include = scenario.label if scenario is not None else label
+    return f"run: python -m dsense auto-scenes {project_name} --include {include} --repeat 2 --yes"
+
+
+def _scenario_by_normalized_label(label: str):
+    for scenario in all_scenarios():
+        if _normalize_label(scenario.label) == label:
+            return scenario
+    return None
+
+
+def _is_baseline_label(label: str) -> bool:
+    return _normalize_label(label).startswith("baseline_")
+
+
+def _normalize_label(label: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(label).strip().lower())
+    return re.sub(r"_+", "_", normalized).strip("_") or "unknown"
 
 
 def _notify_progress(callback: ProgressCallback | None, event: dict[str, object]) -> None:
