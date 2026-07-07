@@ -11,6 +11,7 @@ from dsense.tui_render import compact_live_observation_lines, live_footer_text, 
 from dsense.tui_render import evaluation_repeatability_lines, labels_needing_more_takes, useful_channel_lines
 from dsense.scenarios import SCENARIO_GROUPS
 from dsense.tui import (
+    SceneRecorderTUI,
     TABS,
     clip_text,
     classifier_summary_lines,
@@ -136,6 +137,27 @@ def test_tui_job_manager_records_cancel_request(tmp_path, monkeypatch):
         raise AssertionError("job did not cancel")
 
     assert manager.snapshot()[-1].cancel_requested is True
+
+
+def test_tui_program_status_reports_running_job(tmp_path, monkeypatch):
+    import time
+
+    monkeypatch.chdir(tmp_path)
+    app = SceneRecorderTUI.__new__(SceneRecorderTUI)
+    app.config = CaptureConfig(project_name="base")
+    app.job_manager = TuiJobManager("base")
+    app.live_observation = None
+    app.live_message = ""
+    app.intelligence_state = {"status": "ok", "council": {"agreement": "high", "overall_confidence": 0.8}}
+    app.messages = []
+    app._color = lambda pair: pair
+
+    app.job_manager.start("update intelligence", lambda update, cancel: time.sleep(0.02) or "done")
+    lines = [line for line, _ in app._program_status_lines(100)]
+
+    assert any("active: update intelligence" in line for line in lines)
+    assert any("live:" in line for line in lines)
+    assert any("council: ok" in line for line in lines)
 
 
 def test_tui_parser_accepts_channel_groups():

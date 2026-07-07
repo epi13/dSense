@@ -182,13 +182,16 @@ def update_intelligence_job(
     run_orbiters: bool = True,
     run_training: bool = True,
     run_transfer: bool = True,
+    status_callback: Callable[[str], None] | None = None,
 ) -> str:
     latest = ""
 
     def progress(update: dict[str, object]) -> None:
         nonlocal latest
-        step = dict(update.get("step", {}))
+        step = dict(update.get("step", update))
         latest = f"{step.get('name', 'step')} {step.get('status', '')}".strip()
+        if status_callback is not None and latest:
+            status_callback(latest)
 
     state = run_intelligence_update(
         project_name,

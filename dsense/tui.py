@@ -61,6 +61,8 @@ from .workloads import workload_progress_callback
 
 
 class SceneRecorderTUI:
+    STATUS_PANEL_HEIGHT = 5
+
     def __init__(self, screen, config: CaptureConfig):
         self.screen = screen
         self.config = config
@@ -529,28 +531,83 @@ class SceneRecorderTUI:
         self._title("dSense Control Panel", self.config.project_name)
         self._draw_tabs(1, 0, w)
         tab = TABS[self.tab_index]
+        content_h = self._content_height(3, h)
         if tab == "Live":
-            self._draw_live_tab(3, h, w)
+            self._draw_live_tab(3, content_h, w)
         elif tab == "Sense Radar":
-            self._draw_sense_radar_tab(3, h, w)
+            self._draw_sense_radar_tab(3, content_h, w)
         elif tab == "Capture":
-            self._draw_record_tab(fields, selected, 3, h, w)
+            self._draw_record_tab(fields, selected, 3, content_h, w)
         elif tab == "Scenes":
-            self._draw_scenes_tab(3, h, w)
+            self._draw_scenes_tab(3, content_h, w)
         elif tab == "Council":
-            self._draw_council_tab(3, h, w)
+            self._draw_council_tab(3, content_h, w)
         elif tab == "Evaluation":
-            self._draw_evaluation_tab(3, h, w)
+            self._draw_evaluation_tab(3, content_h, w)
         elif tab == "Watchers":
-            self._draw_watcher_tab(3, h, w)
+            self._draw_watcher_tab(3, content_h, w)
         elif tab == "Orbiters":
-            self._draw_orbiters_tab(3, h, w)
+            self._draw_orbiters_tab(3, content_h, w)
         elif tab == "Transfer":
-            self._draw_transfer_tab(3, h, w)
+            self._draw_transfer_tab(3, content_h, w)
         elif tab == "Settings":
-            self._draw_settings_tab(3, h, w)
+            self._draw_settings_tab(3, content_h, w)
+        self._draw_program_status(h, w)
         self._add(h - 2, 2, "m mark | r record | u update intelligence | s snapshot | tab tabs | q quit")
         self.screen.refresh()
+
+    def _content_height(self, y: int, screen_h: int) -> int:
+        return max(y + 4, self._status_panel_y(screen_h) + 3)
+
+    def _status_panel_y(self, screen_h: int) -> int:
+        return max(3, screen_h - self.STATUS_PANEL_HEIGHT - 2)
+
+    def _draw_program_status(self, h: int, w: int) -> None:
+        y = self._status_panel_y(h)
+        panel_h = min(self.STATUS_PANEL_HEIGHT, max(3, h - y - 2))
+        self._box(y, 0, panel_h, w - 1, "Program Status")
+        for offset, (line, color) in enumerate(self._program_status_lines(w), start=1):
+            if offset >= panel_h - 1:
+                break
+            self._add(y + offset, 2, clip_text(line, max(1, w - 4)), color)
+
+    def _program_status_lines(self, width: int) -> list[tuple[str, int]]:
+        jobs = self.job_manager.snapshot()
+        running = [job for job in jobs if job.status == "run"]
+        if running:
+            job = running[-1]
+            detail = job.detail or "working"
+            lines = [(f"active: {job.name}  {job.duration_s:0.1f}s  {detail}", self._color(3))]
+        else:
+            completed = [job for job in jobs if job.status in {"done", "error", "cancelled"}]
+            if completed:
+                job = completed[-1]
+                detail = job.error or job.detail or job.status
+                color = self._color(2 if job.status == "done" else 4 if job.status == "error" else 3)
+                lines = [(f"idle: last {job.name} {job.status}  {detail}", color)]
+            else:
+                lines = [("idle: no background job running", self._color(2))]
+        if self.live_observation is not None:
+            tick = int(self.live_observation.tick)
+            elapsed = max(0.001, float(self.live_observation.elapsed_s))
+            rate = tick / elapsed
+            channel_count = len(dict(self.live_observation.channel_values))
+            lines.append((f"live: sampling tick {tick:06d}  {rate:0.1f}Hz  {channel_count} channels  interval {self.live_observation.interval_classification}", self._color(2)))
+        else:
+            live_text = self.live_message or "waiting for telemetry"
+            lines.append((f"live: {live_text}", self._color(3 if self.live_message else 0)))
+        state = self.intelligence_state
+        if state is None:
+            state = load_intelligence_state(self.config.project_name)
+            self.intelligence_state = state
+        if state:
+            council = dict(state.get("council", {}))
+            lines.append((f"council: {state.get('status', 'unknown')}  agreement {council.get('agreement', 'unknown')}  confidence {council.get('overall_confidence', 0.0)}", self._color(3 if state.get("status") == "warning" else 2)))
+        else:
+            lines.append(("council: not updated yet; press u to refresh local intelligence", self._color(3)))
+        if self.messages:
+            lines.append((f"message: {self.messages[-1]}", self._color(3)))
+        return [(clip_text(line, max(1, width - 4)), color) for line, color in lines]
 
     def _draw_tabs(self, y: int, x: int, width: int) -> None:
         col = x
@@ -1452,6 +1509,7 @@ class SceneRecorderTUI:
                 run_orbiters=self.config.startup_orbiters,
                 run_training=True,
                 run_transfer=True,
+                status_callback=update,
             )
             self.intelligence_state = load_intelligence_state(self.config.project_name)
             self.baseline = load_project_baseline(self.config.project_name)
