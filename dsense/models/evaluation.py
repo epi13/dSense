@@ -4,8 +4,9 @@ from dataclasses import dataclass
 from itertools import combinations
 from pathlib import Path
 
+from dsense.contrastive import extract_contrastive_features, label_to_scene_family
 from dsense.manifest import project_path
-from dsense.models.features import FEATURE_STATS, feature_distance, mean_profile, summarize_preview
+from dsense.models.features import FEATURE_STATS, feature_distance, mean_profile, read_numeric_preview_rows, summarize_preview
 from dsense.utils.files import ensure_dir, read_json, write_json
 from dsense.utils.timebase import utc_now_iso
 
@@ -38,6 +39,7 @@ def evaluate_project_scenes(project_name: str, out_path: Path | None = None) -> 
         "baseline_drift": _baseline_drift(samples),
         "channel_usefulness_ranking": _channel_usefulness(samples),
         "label_distance_matrix": _label_distance_matrix(samples),
+        "contrastive_evaluation": _contrastive_evaluation(samples),
     }
     report["answers"] = _research_answers(report)
     out = out_path or evaluation_report_path(project_name)
@@ -119,6 +121,10 @@ def print_evaluation_report(report: dict[str, object]) -> None:
     print(f"{'actual':<24} predicted counts")
     for actual in labels:
         print(f"{actual:<24} {matrix[actual]}")
+    contrastive = dict(report.get("contrastive_evaluation", {}))
+    if contrastive:
+        print("")
+        print(f"Contrastive temporal: family_accuracy={contrastive.get('family_accuracy')} label_accuracy={contrastive.get('label_accuracy')}")
 
 
 def _label_counts(samples: list[SceneSample]) -> dict[str, int]:
@@ -126,6 +132,84 @@ def _label_counts(samples: list[SceneSample]) -> dict[str, int]:
     for sample in samples:
         counts[sample.label] = counts.get(sample.label, 0) + 1
     return counts
+
+
+def _contrastive_evaluation(samples: list[SceneSample]) -> dict[str, object]:
+    contrastive_samples = []
+    for sample in samples:
+        rows = read_numeric_preview_rows(sample.scene_dir / "preview.csv")
+        features = extract_contrastive_features(rows) if rows else {}
+        if features:
+            contrastive_samples.append((sample, label_to_scene_family(sample.label), features))
+    family_matrix: dict[str, dict[str, int]] = {}
+    label_matrix: dict[str, dict[str, int]] = {}
+    low_confidence: list[dict[str, object]] = []
+    mismatches: list[dict[str, object]] = []
+    family_correct = 0
+    label_correct = 0
+    evaluated = 0
+    for sample, family, features in contrastive_samples:
+        training = [(other, other_family, other_features) for other, other_family, other_features in contrastive_samples if other.scene_id != sample.scene_id]
+        family_profiles = {
+            name: mean_profile([other_features for _, other_family, other_features in training if other_family == name])
+            for name in sorted({other_family for _, other_family, _ in training})
+        }
+        label_profiles = {
+            name: mean_profile([other_features for other, _, other_features in training if other.label == name])
+            for name in sorted({other.label for other, _, _ in training})
+        }
+        family_prediction = _nearest_profile(family_profiles, features)
+        label_prediction = _nearest_profile(label_profiles, features)
+        predicted_family = str(family_prediction.get("label", "unknown"))
+        predicted_label = str(label_prediction.get("label", "unknown"))
+        family_matrix.setdefault(family, {})
+        family_matrix[family][predicted_family] = family_matrix[family].get(predicted_family, 0) + 1
+        label_matrix.setdefault(sample.label, {})
+        label_matrix[sample.label][predicted_label] = label_matrix[sample.label].get(predicted_label, 0) + 1
+        evaluated += 1
+        if predicted_family == family:
+            family_correct += 1
+        if predicted_label == sample.label:
+            label_correct += 1
+        confidence = min(float(family_prediction.get("confidence", 0.0)), float(label_prediction.get("confidence", 0.0)))
+        if confidence < 0.25:
+            low_confidence.append({"scene_id": sample.scene_id, "label": sample.label, "family": family, "confidence": round(confidence, 3)})
+        if predicted_family != family or predicted_label != sample.label:
+            mismatches.append({
+                "scene_id": sample.scene_id,
+                "actual_family": family,
+                "predicted_family": predicted_family,
+                "actual_label": sample.label,
+                "predicted_label": predicted_label,
+            })
+    return {
+        "evaluated": evaluated,
+        "family_accuracy": round(family_correct / evaluated, 6) if evaluated else 0.0,
+        "label_accuracy": round(label_correct / evaluated, 6) if evaluated else 0.0,
+        "family_confusion": family_matrix,
+        "label_confusion": label_matrix,
+        "low_confidence_scenes": low_confidence[:20],
+        "mismatches": mismatches[:20],
+    }
+
+
+def _nearest_profile(profiles: dict[str, dict[str, float]], features: dict[str, float]) -> dict[str, object]:
+    distances = []
+    for label, profile in profiles.items():
+        distance, contributions = feature_distance(features, profile)
+        if contributions:
+            distances.append((distance, label))
+    if not distances:
+        return {"label": "unknown", "confidence": 0.0, "distance": 0.0}
+    distances.sort(key=lambda item: (item[0], item[1]))
+    distance, label = distances[0]
+    second = distances[1][0] if len(distances) > 1 else None
+    confidence = 1.0 / (1.0 + distance)
+    if second is None:
+        confidence *= 0.35
+    else:
+        confidence *= max(0.0, second - distance) / max(second, 1.0)
+    return {"label": label, "confidence": round(max(0.0, min(confidence, 0.85)), 3), "distance": round(distance, 6)}
 
 
 def _within_label_similarity(samples: list[SceneSample]) -> dict[str, object]:

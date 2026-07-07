@@ -77,6 +77,9 @@ python -m dsense scene demo_lab --label linux_activity --duration 5 --channels p
 python -m dsense train-baseline
 python -m dsense train-classifier
 python -m dsense train-timeseries
+python -m dsense train-contrastive base
+python -m pip install -e ".[ml]"
+python -m dsense train-contrastive base --backend torch_tcn
 python -m dsense update-intelligence base
 python -m dsense council-status base
 python -m dsense extract-features base
@@ -147,6 +150,7 @@ python -m dsense baseline-suite base --target-scenes 200 --yes
 python -m dsense train-baseline base
 python -m dsense train-classifier base
 python -m dsense train-timeseries base
+python -m dsense train-contrastive base
 python -m dsense update-intelligence base
 python -m dsense validate base --verbose
 python -m dsense evaluate-scenes base
@@ -212,25 +216,43 @@ Live View hotkeys:
 - `TAB` switches tabs
 - `q` exits
 
-Press `u` from the TUI setup screen to run **Update Intelligence** again. This is the primary manual update path and refreshes validation, baseline, classifier, time-series, evaluation, watcher/orbiter context, transfer, and Council state. Focused commands such as validation and export remain available, but the main workflow is one comprehensive local update rather than separate model operations.
+Press `u` from the TUI setup screen to run **Update Intelligence** again. This is the primary manual update path and refreshes validation, baseline, classifier, time-series, contrastive temporal profiles, evaluation, watcher/orbiter context, transfer, and Council state. Focused commands such as validation and export remain available, but the main workflow is one comprehensive local update rather than separate model operations.
 
-The baseline model is stored at `datasets/<project_name>/exports/baseline_model.json`. The classifier is stored at `datasets/<project_name>/exports/classifier.json`. The time-series model is stored at `datasets/<project_name>/exports/timeseries_model.json`. These use accepted scene previews to build baseline channel profiles, label summaries, and temporal profiles. You can refresh them explicitly with:
+The baseline model is stored at `datasets/<project_name>/exports/baseline_model.json`. The classifier is stored at `datasets/<project_name>/exports/classifier.json`. The time-series model is stored at `datasets/<project_name>/exports/timeseries_model.json`. The contrastive temporal model is stored at `datasets/<project_name>/exports/contrastive_model.json`, with optional TCN weights in `contrastive_tcn.pt`. These use accepted scene previews to build baseline channel profiles, label summaries, temporal profiles, and broad scene-family comparisons. You can refresh them explicitly with:
 
 ```bash
 python -m dsense train-baseline --require-valid
 python -m dsense train-classifier --require-valid
 python -m dsense train-timeseries --require-valid
+python -m dsense train-contrastive base --require-valid
+python -m dsense train-contrastive base --backend torch_tcn
 python -m dsense update-intelligence base
 python -m dsense council-status base
 ```
 
+Install the optional PyTorch backend with:
+
+```bash
+python -m pip install -e ".[ml]"
+```
+
 `update-intelligence` prints terminal progress for each step. Use `--json` to print the final state as JSON, or `--force` to refresh cacheable startup artifacts such as incremental orbiters.
 
-### Intelligence Council and time-series model
+### Intelligence Council and temporal models
 
-The Intelligence Council is a coordination/reporting layer, not a claim of awareness. It combines coordinated local evidence layers: baseline readiness, deterministic classifier labels, time-series profile agreement, watcher events, orbiter summary availability, evaluation quality, baseline drift, useful channels, and transfer status. It writes inspectable JSON to `exports/intelligence_state.json` with confidence, warnings, recommendations, best channels, weak labels, and per-step status.
+The Intelligence Council is a coordination/reporting layer, not a claim of awareness. It combines coordinated local evidence layers: baseline readiness, deterministic classifier labels, time-series profile agreement, contrastive temporal family/label agreement, watcher events, orbiter summary availability, evaluation quality, baseline drift, useful channels, and transfer status. It writes inspectable JSON to `exports/intelligence_state.json` with confidence, warnings, recommendations, best channels, weak labels, and per-step status.
 
 The time-series model is dependency-light and standard-library based. It reads accepted `preview.csv` files, discovers numeric channels dynamically, extracts temporal features such as first/last value, slope, peak count, roughness, rolling variance, max absolute delta, and window medians, then predicts by normalized distance to per-label profiles. It is additive and does not replace the deterministic classifier.
+
+The contrastive temporal layer is another additive Council vote designed for limited-data pattern discovery. Its default `profile` backend is deterministic and dependency-free: it extracts richer timing features, groups labels into broad families such as `baseline`, `machine_activity`, and `user_presence`, then compares new scenes against both family and exact-label profiles. The optional `torch_tcn` backend trains a small CPU-friendly Siamese TCN when PyTorch is installed, saves learned prototypes in JSON, and saves encoder weights separately. This layer is experimental and does not prove biological presence; it only compares learned timing/system-signal patterns against local labeled scenes.
+
+Example contrastive workflow:
+
+```bash
+python -m dsense train-contrastive base
+python -m dsense train-contrastive base --backend torch_tcn
+python -m dsense update-intelligence base
+```
 
 ## Phase 7 evaluation
 

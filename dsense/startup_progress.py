@@ -31,6 +31,7 @@ STEP_LABELS = {
     "train_baseline": "Baseline",
     "train_classifier": "Classifier",
     "train_timeseries": "Time-series",
+    "train_contrastive": "Contrastive",
     "load_models": "Load Models",
     "evaluate": "Evaluation",
     "watcher": "Watchers",

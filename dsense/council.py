@@ -8,6 +8,7 @@ from time import monotonic
 from .autotest import validate_dataset
 from .baseline import load_project_baseline, score_against_baseline, train_and_save_project_baseline
 from .classifier import load_project_classifier, predict_scene, train_and_save_project_classifier
+from .contrastive import load_project_contrastive, predict_scene_contrastive, train_and_save_project_contrastive
 from .manifest import init_project, project_path
 from .models.evaluation import evaluate_project_scenes, evaluation_report_path
 from .orbiters import evaluate_project_orbiters, read_recent_orbiter_summaries, update_project_orbiters_incremental
@@ -55,6 +56,7 @@ def run_intelligence_update(
             "baseline": {},
             "classifier": {},
             "timeseries": {},
+            "contrastive": {},
             "watcher": {},
             "orbiters": {},
             "evaluation": {},
@@ -131,6 +133,7 @@ def run_intelligence_update(
         run_step("train_baseline", lambda progress: _baseline_summary(train_and_save_project_baseline(project_name), models, progress))
         run_step("train_classifier", lambda progress: _classifier_summary(train_and_save_project_classifier(project_name), models, progress))
         run_step("train_timeseries", lambda progress: _timeseries_summary(train_and_save_project_timeseries(project_name), models, progress))
+        run_step("train_contrastive", lambda progress: _contrastive_summary(train_and_save_project_contrastive(project_name), models, progress))
     else:
         run_step("load_models", lambda progress: _load_model_summaries(project_name, models, progress))
 
@@ -179,6 +182,7 @@ def build_council_summary(project_name: str, models: dict[str, object] | None = 
     baseline = dict(models.get("baseline", {}))
     classifier = dict(models.get("classifier", {}))
     timeseries = dict(models.get("timeseries", {}))
+    contrastive = dict(models.get("contrastive", {}))
     evaluation = dict(models.get("evaluation", {}))
     watcher = dict(models.get("watcher", {}))
     orbiters = dict(models.get("orbiters", {}))
@@ -186,6 +190,7 @@ def build_council_summary(project_name: str, models: dict[str, object] | None = 
     baseline_count = int(baseline.get("scene_count", 0) or 0)
     classifier_count = int(classifier.get("scene_count", 0) or 0)
     timeseries_count = int(timeseries.get("scene_count", 0) or 0)
+    contrastive_count = int(contrastive.get("scene_count", 0) or 0)
     label_counts = {str(k): int(v) for k, v in dict(classifier.get("label_counts", timeseries.get("label_counts", {}))).items()}
     grouped_label_counts = _repeatability_label_counts(label_counts)
 
@@ -207,6 +212,8 @@ def build_council_summary(project_name: str, models: dict[str, object] | None = 
         warnings.append("no watcher events available")
     if not orbiters.get("summary_count"):
         warnings.append("orbiter summaries missing")
+    if contrastive_count == 0:
+        warnings.append("contrastive layer not trained")
 
     confusion = dict(evaluation.get("confusion_matrix", {}))
     accuracy = float(confusion.get("accuracy", 0.0) or 0.0)
@@ -231,6 +238,7 @@ def build_council_summary(project_name: str, models: dict[str, object] | None = 
         min(1.0, baseline_count / 6.0),
         min(1.0, classifier_count / 8.0),
         min(1.0, timeseries_count / 8.0),
+        min(1.0, contrastive_count / 10.0) * 0.75,
         accuracy if accuracy else 0.25 if classifier_count and timeseries_count else 0.0,
         max(0.0, 1.0 - min(max_drift, 10.0) / 10.0),
     ]
@@ -258,14 +266,20 @@ def classify_with_council(project_name: str, scene_dir: Path) -> dict[str, objec
     baseline = load_project_baseline(project_name)
     classifier = load_project_classifier(project_name)
     timeseries = load_project_timeseries(project_name)
+    contrastive = load_project_contrastive(project_name)
     rows = read_preview_rows(preview) if preview.exists() else []
     latest = rows[-1] if rows else {}
     deterministic = predict_scene(classifier, preview)
     temporal = predict_scene_timeseries(timeseries, preview)
+    contrastive_prediction = predict_scene_contrastive(contrastive, preview)
     baseline_status = score_against_baseline(_core_values(latest), baseline)
     agreement = "unknown"
     if deterministic.get("label") != "unknown" and temporal.get("label") != "unknown":
         agreement = "high" if deterministic.get("label") == temporal.get("label") else "low"
+        contrastive_label = str(contrastive_prediction.get("label", "unknown"))
+        contrastive_confidence = float(contrastive_prediction.get("confidence", 0.0) or 0.0)
+        if agreement == "low" and contrastive_label in {deterministic.get("label"), temporal.get("label")} and contrastive_confidence >= 0.4:
+            agreement = "medium"
     warnings = []
     if agreement == "low":
         warnings.append("classifier and time-series disagree")
@@ -274,6 +288,7 @@ def classify_with_council(project_name: str, scene_dir: Path) -> dict[str, objec
         "scene_dir": str(scene_dir),
         "deterministic_classifier": deterministic,
         "time_series_classifier": temporal,
+        "contrastive_temporal": contrastive_prediction,
         "baseline_anomaly": baseline_status,
         "watcher_context": read_recent_watcher_events(project_name, 5),
         "orbiter_context": read_recent_orbiter_summaries(project_path(project_name), 5),
@@ -329,18 +344,43 @@ def _timeseries_summary(model, models: dict[str, object], progress: ProgressCall
     return summary
 
 
+def _contrastive_summary(model, models: dict[str, object], progress: ProgressCallback | None = None) -> dict[str, object]:
+    if progress:
+        progress({"progress": 1.0, "current": model.scene_count, "total": model.scene_count, "message": f"trained {model.scene_count} contrastive profiles"})
+    summary = {
+        "scene_count": model.scene_count,
+        "backend": model.backend,
+        "label_counts": model.label_counts,
+        "family_counts": model.family_counts,
+        "sequence_channels": model.sequence_channels,
+        "training_warnings": dict(model.feature_manifest).get("training_warnings", []),
+    }
+    models["contrastive"] = summary
+    return summary
+
+
 def _load_model_summaries(project_name: str, models: dict[str, object], progress: ProgressCallback | None = None) -> dict[str, object]:
     if progress:
         progress({"progress": 0.2, "message": "loading existing artifacts"})
     baseline = load_project_baseline(project_name)
     classifier = load_project_classifier(project_name)
     timeseries = load_project_timeseries(project_name)
+    contrastive = load_project_contrastive(project_name)
     if baseline is not None:
         models["baseline"] = {"scene_count": baseline.scene_count, "channel_count": len(baseline.channels), "channels": sorted(baseline.channels)}
     if classifier is not None:
         models["classifier"] = {"scene_count": classifier.scene_count, "baseline_scene_count": classifier.baseline_scene_count, "label_counts": classifier.label_counts}
     if timeseries is not None:
         models["timeseries"] = {"scene_count": timeseries.scene_count, "label_counts": timeseries.label_counts, "sequence_channels": timeseries.sequence_channels}
+    if contrastive is not None:
+        models["contrastive"] = {
+            "scene_count": contrastive.scene_count,
+            "backend": contrastive.backend,
+            "label_counts": contrastive.label_counts,
+            "family_counts": contrastive.family_counts,
+            "sequence_channels": contrastive.sequence_channels,
+            "training_warnings": dict(contrastive.feature_manifest).get("training_warnings", []),
+        }
     if progress:
         progress({"progress": 1.0, "message": "existing artifacts loaded"})
     return {"loaded": True}

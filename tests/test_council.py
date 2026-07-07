@@ -13,6 +13,7 @@ def test_run_intelligence_update_writes_state(sample_dataset):
     assert state["models"]["baseline"]["scene_count"] == 1
     assert state["models"]["classifier"]["scene_count"] == 2
     assert state["models"]["timeseries"]["scene_count"] == 2
+    assert state["models"]["contrastive"]["scene_count"] == 2
     assert "overall_confidence" in state["council"]
 
 
@@ -36,8 +37,9 @@ def test_classify_with_council_combines_local_layers(sample_dataset):
 
     assert "deterministic_classifier" in result
     assert "time_series_classifier" in result
+    assert "contrastive_temporal" in result
     assert "baseline_anomaly" in result
-    assert result["agreement"] in {"unknown", "low", "high"}
+    assert result["agreement"] in {"unknown", "low", "medium", "high"}
 
 
 def test_council_groups_user_label_variants_for_repeatability():

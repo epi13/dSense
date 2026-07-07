@@ -173,6 +173,7 @@ def test_intelligence_cli_commands_parse():
     parser = build_parser()
 
     assert parser.parse_args(["train-timeseries", "base"]).project_name == "base"
+    assert parser.parse_args(["train-contrastive", "base", "--backend", "torch_tcn"]).backend == "torch_tcn"
     assert parser.parse_args(["update-intelligence", "base", "--no-watchers"]).no_watchers is True
     assert parser.parse_args(["council-status", "base"]).project_name == "base"
 

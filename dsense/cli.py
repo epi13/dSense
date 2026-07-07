@@ -6,6 +6,7 @@ from .baseline import train_and_save_project_baseline
 from .baseline_suite import baseline_suite_report_path, run_baseline_suite
 from .channels import parse_channel_groups
 from .classifier import train_and_save_project_classifier
+from .contrastive import contrastive_path, train_and_save_project_contrastive
 from .council import intelligence_state_path, load_intelligence_state, run_intelligence_update
 from .doctor import doctor_ok, print_doctor_report, run_doctor
 from .gemma_edge import gemma_edge_status
@@ -408,12 +409,30 @@ def cmd_train_timeseries(args):
     print(timeseries_path(project_name))
 
 
+def cmd_train_contrastive(args):
+    project_name = args.project_name or DEFAULT_PROJECT
+    init_project(project_name)
+    stats = _project_scene_stats(project_name)
+    print(f"Training contrastive temporal model: {project_name}", flush=True)
+    print(f"  scenes discovered: {stats['total']} total, {stats['accepted']} accepted, {stats['baseline']} baseline labels", flush=True)
+    _require_valid_dataset(project_name, args.require_valid)
+    print(f"  backend: {args.backend}", flush=True)
+    print("  extracting temporal contrastive features and family profiles...", flush=True)
+    model = train_and_save_project_contrastive(project_name, backend=args.backend)
+    manifest = dict(model.feature_manifest)
+    for warning in list(manifest.get("training_warnings", [])):
+        print(f"  warning: {warning}", flush=True)
+    print(f"  model families: {len(model.family_counts)} families, labels: {len(model.label_counts)}, features: {manifest.get('feature_count', 0)}", flush=True)
+    print(f"Trained contrastive temporal model for {project_name}: {model.scene_count} scenes, backend={model.backend}")
+    print(contrastive_path(project_name))
+
+
 def cmd_update_intelligence(args):
     project_name = args.project_name or DEFAULT_PROJECT
     init_project(project_name)
     if not args.json:
         print(f"Updating local intelligence stack: {project_name}", flush=True)
-    step_order = ["init_project", "validate", "train_baseline" if not args.no_training else "load_models", "train_classifier", "train_timeseries", "evaluate", "watcher", "orbiters", "transfer", "write_state"]
+    step_order = ["init_project", "validate", "train_baseline" if not args.no_training else "load_models", "train_classifier", "train_timeseries", "train_contrastive", "evaluate", "watcher", "orbiters", "transfer", "write_state"]
     seen_done: set[str] = set()
 
     def progress(update: dict[str, object]) -> None:
@@ -466,7 +485,7 @@ def cmd_council_status(args):
     models = dict(state.get("models", {}))
     print(f"Intelligence Council: {project_name}")
     print(f"Status: {state.get('status')}  Agreement: {council.get('agreement')}  Confidence: {council.get('overall_confidence')}")
-    for name in ("baseline", "classifier", "timeseries", "watcher", "orbiters", "evaluation", "transfer"):
+    for name in ("baseline", "classifier", "timeseries", "contrastive", "watcher", "orbiters", "evaluation", "transfer"):
         print(f"{name}: {models.get(name, {})}")
     warnings = list(council.get("warnings", []))
     recommendations = list(council.get("recommendations", []))
@@ -769,6 +788,7 @@ def build_parser():
     sp.add_argument("--require-valid", action="store_true", help="fail before training if dataset validation has errors")
     sp = sub.add_parser("train-classifier"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to train (default: {DEFAULT_PROJECT})"); sp.add_argument("--require-valid", action="store_true", help="fail before training if dataset validation has errors"); sp.set_defaults(func=cmd_train_classifier)
     sp = sub.add_parser("train-timeseries"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to train (default: {DEFAULT_PROJECT})"); sp.add_argument("--require-valid", action="store_true", help="fail before training if dataset validation has errors"); sp.set_defaults(func=cmd_train_timeseries)
+    sp = sub.add_parser("train-contrastive"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to train (default: {DEFAULT_PROJECT})"); sp.add_argument("--backend", choices=["profile", "torch_tcn", "tcn"], default="profile"); sp.add_argument("--require-valid", action="store_true", help="fail before training if dataset validation has errors"); sp.set_defaults(func=cmd_train_contrastive)
     sp = sub.add_parser("update-intelligence"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to update (default: {DEFAULT_PROJECT})"); sp.add_argument("--no-watchers", action="store_true", help="skip watcher scan and use existing watcher events"); sp.add_argument("--no-orbiters", action="store_true", help="skip orbiter evaluation and use existing summaries"); sp.add_argument("--no-training", action="store_true", help="load existing models instead of retraining"); sp.add_argument("--no-transfer", action="store_true", help="skip transfer bundle export"); sp.add_argument("--force", action="store_true", help="ignore cache/current-state checks where supported"); sp.add_argument("--json", action="store_true", help="print final intelligence state as JSON"); sp.set_defaults(func=cmd_update_intelligence)
     sp = sub.add_parser("council-status"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to inspect (default: {DEFAULT_PROJECT})"); sp.set_defaults(func=cmd_council_status)
     sp = sub.add_parser("export-transfer"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to export (default: {DEFAULT_PROJECT})"); sp.add_argument("--require-valid", action="store_true", help="fail before export if dataset validation has errors"); sp.add_argument("--redact", action="store_true", help="write a privacy-redacted safe transfer bundle"); sp.set_defaults(func=cmd_export_transfer)
