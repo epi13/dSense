@@ -272,7 +272,10 @@ def cmd_tui(args):
         args.no_startup_orbiters = True
         args.no_startup_training = True
         args.no_startup_suite = True
+        args.startup_mode = "fast"
         print("Fast start: loading existing artifacts and skipping expensive startup work.")
+    if args.force_startup_update:
+        args.startup_mode = "full"
     print("Opening TUI startup pipeline..." if startup_intelligence else "Opening TUI without startup intelligence...")
     duration = _validated_duration(args.duration, args.pre_roll, args.action, args.post_roll)
     _validate_repeat_tick(args.repeat, args.tick_hz)
@@ -303,6 +306,11 @@ def cmd_tui(args):
         start_tab=args.start_tab,
         fast_start=args.fast_start,
         force_startup_update=args.force_startup_update,
+        startup_mode=args.startup_mode,
+        startup_cache_policy=args.startup_cache_policy,
+        evaluation_mode=args.evaluation_mode,
+        workers=args.workers,
+        profile_startup=args.profile_startup,
     )
 
 
@@ -432,7 +440,7 @@ def cmd_update_intelligence(args):
     init_project(project_name)
     if not args.json:
         print(f"Updating local intelligence stack: {project_name}", flush=True)
-    step_order = ["init_project", "validate", "train_baseline" if not args.no_training else "load_models", "train_classifier", "train_timeseries", "train_contrastive", "evaluate", "watcher", "orbiters", "transfer", "write_state"]
+    step_order = ["init_project", "validate", "feature_store", "train_baseline" if not args.no_training else "load_models", "train_classifier", "train_timeseries", "train_contrastive", "evaluate", "watcher", "orbiters", "transfer", "write_state"]
     seen_done: set[str] = set()
 
     def progress(update: dict[str, object]) -> None:
@@ -465,6 +473,10 @@ def cmd_update_intelligence(args):
         run_training=not args.no_training,
         run_transfer=not args.no_transfer,
         force_update=args.force,
+        workers=args.workers,
+        startup_cache_policy=args.startup_cache_policy,
+        evaluation_mode=args.evaluation_mode,
+        profile_startup=args.profile_startup,
         progress_callback=progress,
     )
     if args.json:
@@ -473,6 +485,10 @@ def cmd_update_intelligence(args):
     council = dict(state.get("council", {}))
     print(f"Status: {state.get('status')}")
     print(f"Agreement: {council.get('agreement')}  confidence={council.get('overall_confidence')}")
+    profile = dict(state.get("startup_profile", {}))
+    slowest = dict(profile.get("slowest_step", {}))
+    if slowest:
+        print(f"Slowest step: {slowest.get('name')} {float(slowest.get('elapsed_s', 0.0) or 0.0):.3f}s")
     print(intelligence_state_path(project_name))
 
 
@@ -528,7 +544,7 @@ def cmd_evaluate_scenes(args):
     project_name = args.project_name or DEFAULT_PROJECT
     init_project(project_name)
     out_path = Path(args.out) if args.out else None
-    report = evaluate_project_scenes(project_name, out_path=out_path)
+    report = evaluate_project_scenes(project_name, out_path=out_path, mode=args.evaluation_mode, force=args.force)
     print_evaluation_report(report)
     print(out_path or evaluation_report_path(project_name))
 
@@ -741,6 +757,11 @@ def _add_tui_args(sp):
     sp.add_argument("--start-tab", choices=["live", "sense-radar", "council", "capture", "scenes", "evaluation", "watchers", "orbiters", "transfer", "settings"], default="live", help="initial TUI tab")
     sp.add_argument("--fast-start", action="store_true", help="open quickly using existing artifacts; skips watcher, orbiter, training, and startup suite work")
     sp.add_argument("--force-startup-update", action="store_true", help="ignore startup cache checks and regenerate startup artifacts where supported")
+    sp.add_argument("--startup-mode", choices=["balanced", "fast", "full"], default="balanced", help="balanced opens first and refreshes in background; full blocks for rebuild")
+    sp.add_argument("--startup-cache-policy", choices=["auto", "rebuild", "off"], default="auto", help="artifact cache policy for startup intelligence")
+    sp.add_argument("--evaluation-mode", choices=["full", "fast", "sampled"], default="fast", help="evaluation work level for startup intelligence")
+    sp.add_argument("--workers", type=int, help="workers for explicit feature-store rebuilds; DSENSE_WORKERS also works")
+    sp.add_argument("--profile-startup", action="store_true", help="write startup timing profile")
 
 
 def build_parser():
@@ -789,11 +810,11 @@ def build_parser():
     sp = sub.add_parser("train-classifier"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to train (default: {DEFAULT_PROJECT})"); sp.add_argument("--require-valid", action="store_true", help="fail before training if dataset validation has errors"); sp.set_defaults(func=cmd_train_classifier)
     sp = sub.add_parser("train-timeseries"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to train (default: {DEFAULT_PROJECT})"); sp.add_argument("--require-valid", action="store_true", help="fail before training if dataset validation has errors"); sp.set_defaults(func=cmd_train_timeseries)
     sp = sub.add_parser("train-contrastive"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to train (default: {DEFAULT_PROJECT})"); sp.add_argument("--backend", choices=["profile", "torch_tcn", "tcn"], default="profile"); sp.add_argument("--require-valid", action="store_true", help="fail before training if dataset validation has errors"); sp.set_defaults(func=cmd_train_contrastive)
-    sp = sub.add_parser("update-intelligence"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to update (default: {DEFAULT_PROJECT})"); sp.add_argument("--no-watchers", action="store_true", help="skip watcher scan and use existing watcher events"); sp.add_argument("--no-orbiters", action="store_true", help="skip orbiter evaluation and use existing summaries"); sp.add_argument("--no-training", action="store_true", help="load existing models instead of retraining"); sp.add_argument("--no-transfer", action="store_true", help="skip transfer bundle export"); sp.add_argument("--force", action="store_true", help="ignore cache/current-state checks where supported"); sp.add_argument("--json", action="store_true", help="print final intelligence state as JSON"); sp.set_defaults(func=cmd_update_intelligence)
+    sp = sub.add_parser("update-intelligence"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to update (default: {DEFAULT_PROJECT})"); sp.add_argument("--no-watchers", action="store_true", help="skip watcher scan and use existing watcher events"); sp.add_argument("--no-orbiters", action="store_true", help="skip orbiter evaluation and use existing summaries"); sp.add_argument("--no-training", action="store_true", help="load existing models instead of retraining"); sp.add_argument("--no-transfer", action="store_true", help="skip transfer bundle export"); sp.add_argument("--force", action="store_true", help="ignore cache/current-state checks where supported"); sp.add_argument("--json", action="store_true", help="print final intelligence state as JSON"); sp.add_argument("--workers", type=int, help="workers for feature-store rebuilds; DSENSE_WORKERS also works"); sp.add_argument("--startup-cache-policy", choices=["auto", "rebuild", "off"], default="auto", help="artifact cache policy"); sp.add_argument("--evaluation-mode", choices=["full", "fast", "sampled"], default="full", help="evaluation work level"); sp.add_argument("--profile-startup", action="store_true", help="write startup timing profile"); sp.set_defaults(func=cmd_update_intelligence)
     sp = sub.add_parser("council-status"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to inspect (default: {DEFAULT_PROJECT})"); sp.set_defaults(func=cmd_council_status)
     sp = sub.add_parser("export-transfer"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to export (default: {DEFAULT_PROJECT})"); sp.add_argument("--require-valid", action="store_true", help="fail before export if dataset validation has errors"); sp.add_argument("--redact", action="store_true", help="write a privacy-redacted safe transfer bundle"); sp.set_defaults(func=cmd_export_transfer)
     sp = sub.add_parser("privacy-report"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to inspect (default: {DEFAULT_PROJECT})"); sp.add_argument("--out", help="write privacy report JSON to this path"); sp.set_defaults(func=cmd_privacy_report)
-    sp = sub.add_parser("evaluate-scenes"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to evaluate (default: {DEFAULT_PROJECT})"); sp.add_argument("--out", help="write report JSON to this path"); sp.set_defaults(func=cmd_evaluate_scenes)
+    sp = sub.add_parser("evaluate-scenes"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to evaluate (default: {DEFAULT_PROJECT})"); sp.add_argument("--out", help="write report JSON to this path"); sp.add_argument("--evaluation-mode", choices=["full", "fast", "sampled"], default="full", help="evaluation work level"); sp.add_argument("--force", action="store_true", help="ignore cached evaluation report"); sp.set_defaults(func=cmd_evaluate_scenes)
     sp = sub.add_parser("extract-features"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to extract (default: {DEFAULT_PROJECT})"); sp.add_argument("--out", help="write feature JSON to this path"); sp.set_defaults(func=cmd_extract_features)
     sp = sub.add_parser("rank-channels"); sp.add_argument("project_name", nargs="?", default=DEFAULT_PROJECT, help=f"project to rank (default: {DEFAULT_PROJECT})"); sp.add_argument("--limit", type=int, default=10, help="number of channels to print"); sp.set_defaults(func=cmd_rank_channels)
     sp = sub.add_parser("inspect-scene"); sp.add_argument("target", help="project name or scene directory"); sp.add_argument("scene_id", nargs="?", help="scene id when target is a project"); sp.add_argument("--project", default=DEFAULT_PROJECT, help=f"classifier project for direct scene paths (default: {DEFAULT_PROJECT})"); sp.set_defaults(func=cmd_inspect_scene)

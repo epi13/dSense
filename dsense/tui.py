@@ -156,11 +156,21 @@ class SceneRecorderTUI:
             scene["accepted"] = decision == "keep"
             write_json(project_path(self.config.project_name) / "scenes" / scene["scene_id"] / "scene.json", scene)
             results.append(scene)
-            self.scenes = load_project_scenes(self.config.project_name)
+            self._upsert_scene(scene)
             if decision == "retake":
                 queue.insert(take, scenario)
             take += 1
         return results
+
+    def _upsert_scene(self, scene: dict[str, object]) -> None:
+        scene_id = str(scene.get("scene_id", ""))
+        for index, existing in enumerate(self.scenes):
+            if str(existing.get("scene_id", "")) == scene_id:
+                self.scenes[index] = scene
+                self.scene_index = index
+                return
+        self.scenes.append(scene)
+        self.scene_index = len(self.scenes) - 1
 
     def _setup_colors(self) -> None:
         if not curses.has_colors():
@@ -190,7 +200,67 @@ class SceneRecorderTUI:
             time.sleep(0.4)
             return
 
+        if self.config.startup_mode in {"balanced", "fast"} and not self.config.force_startup_update:
+            self._run_open_first_startup_pipeline()
+            return
+
         self._run_council_startup_pipeline()
+
+    def _run_open_first_startup_pipeline(self) -> None:
+        init_project(self.config.project_name)
+        self.channels = scan_channels(groups=self.config.channel_groups)
+        self.scenes = load_project_scenes(self.config.project_name)
+        self.baseline = load_project_baseline(self.config.project_name)
+        self.classifier = self._load_classifier()
+        self.timeseries = load_project_timeseries(self.config.project_name)
+        self.intelligence_state = load_intelligence_state(self.config.project_name)
+        status = "Fast start: existing artifacts loaded." if self.config.startup_mode == "fast" else "Live opened with cached artifacts."
+        self.config.startup_baseline_status = status
+        self.messages.append(status)
+        rows = [
+            {"key": "load", "label": "load cached artifacts", "status": "done", "detail": "ready"},
+            {"key": "dashboard", "label": "open live observatory", "status": "done", "detail": "ready"},
+        ]
+        if self.config.startup_mode == "balanced":
+            self._start_background_startup_refresh()
+            rows.append({"key": "refresh", "label": "background intelligence refresh", "status": "active", "detail": "cache-aware"})
+            self.live_message = "intelligence refresh running in background; press u for a full refresh"
+        self._draw_startup_pipeline(rows)
+        time.sleep(0.25)
+
+    def _start_background_startup_refresh(self) -> None:
+        def job(update, cancel_event) -> str:
+            update("checking cached intelligence")
+            if cancel_event.is_set():
+                return "cancelled before start"
+            detail = update_intelligence_job(
+                self.config.project_name,
+                startup=True,
+                run_watchers=False,
+                run_orbiters=False,
+                run_training=self.config.startup_training,
+                run_transfer=False,
+                workers=self.config.workers,
+                startup_cache_policy=self.config.startup_cache_policy,
+                evaluation_mode=self.config.evaluation_mode,
+                status_callback=update,
+            )
+            self.intelligence_state = load_intelligence_state(self.config.project_name)
+            self.baseline = load_project_baseline(self.config.project_name)
+            self.classifier = self._load_classifier()
+            self.timeseries = load_project_timeseries(self.config.project_name)
+            self.scenes = load_project_scenes(self.config.project_name)
+            if self.intelligence_state is not None:
+                self.validation_summary = self._validation_summary_from_state(self.intelligence_state)
+                self.evaluation_report = dict(dict(self.intelligence_state.get("models", {})).get("evaluation", {}))
+                profile = dict(self.intelligence_state.get("startup_profile", {}))
+                slowest = dict(profile.get("slowest_step", {}))
+                if slowest:
+                    self.messages.append(f"slowest startup step: {slowest.get('name')} {float(slowest.get('elapsed_s', 0.0) or 0.0):.2f}s")
+            self.live_message = "background intelligence refresh complete"
+            return detail
+
+        self.job_manager.start("startup intelligence refresh", job)
 
     def _run_council_startup_pipeline(self) -> None:
         progress_rows = initial_progress_rows()
@@ -219,6 +289,10 @@ class SceneRecorderTUI:
                     force_update=self.config.force_startup_update,
                     skip_steps=skip_steps,
                     progress_callback=progress,
+                    workers=self.config.workers,
+                    startup_cache_policy=self.config.startup_cache_policy,
+                    evaluation_mode=self.config.evaluation_mode,
+                    profile_startup=self.config.profile_startup,
                 )
             except Exception as exc:
                 error_holder["error"] = str(exc)
@@ -1509,6 +1583,9 @@ class SceneRecorderTUI:
                 run_orbiters=self.config.startup_orbiters,
                 run_training=True,
                 run_transfer=True,
+                workers=self.config.workers,
+                startup_cache_policy=self.config.startup_cache_policy,
+                evaluation_mode="full",
                 status_callback=update,
             )
             self.intelligence_state = load_intelligence_state(self.config.project_name)

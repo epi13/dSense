@@ -6,10 +6,12 @@ from pathlib import Path
 from .manifest import project_path
 from .models.evaluation import predict_from_profiles
 from .models.features import feature_manifest, mean_profile, percentile, read_numeric_preview_rows, robust_profile, summarize_rows
+from .models.scene_store import SceneFeatureStore, build_or_load_feature_store, feature_manifest_from_store
 from .utils.files import ensure_dir, read_json, write_json
 from .utils.timebase import utc_now_iso
 
 CHANNELS = ("dt_ns", "sleep_drift_ns", "process_ns_estimate")
+CLASSIFIER_MODEL_VERSION = "classifier-profile-v2"
 
 
 @dataclass(frozen=True)
@@ -37,7 +39,11 @@ class SceneClassifierModel:
 
 
 def train_project_classifier(project_name: str) -> SceneClassifierModel:
-    root = project_path(project_name)
+    store = build_or_load_feature_store(project_name, workers=1)
+    return train_project_classifier_from_store(store)
+
+
+def train_project_classifier_from_store(store: SceneFeatureStore) -> SceneClassifierModel:
     scene_rows: list[dict[str, object]] = []
     baseline_rows: dict[str, list[float]] = {}
     label_counts: dict[str, int] = {}
@@ -46,27 +52,16 @@ def train_project_classifier(project_name: str) -> SceneClassifierModel:
     all_rows: list[dict[str, float]] = []
     baseline_scene_count = 0
 
-    for scene_path in sorted((root / "scenes").glob("scene_*/scene.json")):
-        try:
-            scene = read_json(scene_path)
-        except (OSError, ValueError):
-            continue
-        if scene.get("accepted") is False:
-            continue
-
-        preview_path = scene_path.parent / "preview.csv"
-        if not preview_path.exists():
-            continue
-
-        label = str(scene.get("label", "unknown"))
-        rows = _read_preview_rows(preview_path)
+    for scene in store.accepted_scenes:
+        label = scene.label
+        rows = scene.preview_rows
         if not rows:
             continue
 
-        features = _summarize_rows(rows)
+        features = scene.summary_features or _summarize_rows(rows)
         all_features.append(features)
         all_rows.extend(rows)
-        scene_rows.append({"scene_id": scene.get("scene_id"), "label": label, "features": features})
+        scene_rows.append({"scene_id": scene.scene_id, "label": label, "features": features})
         label_counts[label] = label_counts.get(label, 0) + 1
         label_features.setdefault(label, []).append(features)
 
@@ -87,15 +82,24 @@ def train_project_classifier(project_name: str) -> SceneClassifierModel:
     }
 
     return SceneClassifierModel(
-        project_name=project_name,
+        project_name=store.project_name,
         trained_utc=utc_now_iso(),
         scene_count=len(scene_rows),
         baseline_scene_count=baseline_scene_count,
         label_counts=label_counts,
         detector_baseline=detector_baseline,
         label_profiles=label_profiles,
-        feature_manifest=feature_manifest(all_features, all_rows),
+        feature_manifest=_classifier_manifest(store, all_features, all_rows),
     )
+
+
+def _classifier_manifest(store: SceneFeatureStore, all_features: list[dict[str, float]], all_rows: list[dict[str, float]]) -> dict[str, object]:
+    manifest = feature_manifest_from_store(store)
+    if not manifest.get("features"):
+        manifest = feature_manifest(all_features, all_rows)
+    manifest["model_version"] = CLASSIFIER_MODEL_VERSION
+    manifest["dataset_fingerprint"] = store.fingerprint
+    return manifest
 
 
 def train_and_save_project_classifier(project_name: str) -> SceneClassifierModel:

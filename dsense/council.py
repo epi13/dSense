@@ -6,18 +6,23 @@ from pathlib import Path
 from time import monotonic
 
 from .autotest import validate_dataset
-from .baseline import load_project_baseline, score_against_baseline, train_and_save_project_baseline
-from .classifier import load_project_classifier, predict_scene, train_and_save_project_classifier
-from .contrastive import load_project_contrastive, predict_scene_contrastive, train_and_save_project_contrastive
+from .baseline import BASELINE_MODEL_VERSION, baseline_path, load_project_baseline, score_against_baseline, train_project_baseline_from_store
+from .classifier import CLASSIFIER_MODEL_VERSION, classifier_path, load_project_classifier, predict_scene, train_project_classifier_from_store
+from .contrastive import CONTRASTIVE_MODEL_VERSION, contrastive_path, load_project_contrastive, predict_scene_contrastive, train_project_contrastive_from_store
 from .manifest import init_project, project_path
-from .models.evaluation import evaluate_project_scenes, evaluation_report_path
+from .models.evaluation import evaluate_project_scenes_from_store, evaluation_report_path
+from .models.scene_store import SceneFeatureStore, artifact_matches_fingerprint, build_or_load_feature_store, evaluation_matches_fingerprint
+from .perf import StartupProfiler, resolve_worker_count
 from .orbiters import evaluate_project_orbiters, read_recent_orbiter_summaries, update_project_orbiters_incremental
 from .replay import read_preview_rows
 from .scenarios import all_scenarios
 from .timeseries import (
+    TIMESERIES_MODEL_VERSION,
     load_project_timeseries,
     predict_scene_timeseries,
-    train_and_save_project_timeseries,
+    timeseries_path,
+    train_and_save_project_timeseries as _legacy_train_and_save_project_timeseries,
+    train_project_timeseries_from_store,
 )
 from .transfer import export_transfer_bundle, transfer_bundle_path
 from .utils.files import ensure_dir, read_json, write_json
@@ -27,6 +32,7 @@ from .watcher import read_recent_watcher_events, run_watcher_scan
 
 
 ProgressCallback = Callable[[dict[str, object]], None]
+train_and_save_project_timeseries = _legacy_train_and_save_project_timeseries
 
 
 def intelligence_state_path(project_name: str) -> Path:
@@ -43,13 +49,23 @@ def run_intelligence_update(
     run_transfer: bool = True,
     force_update: bool = False,
     skip_steps: set[str] | None = None,
+    workers: int | None = None,
+    startup_cache_policy: str = "auto",
+    evaluation_mode: str | None = None,
+    profile_startup: bool = False,
     progress_callback: ProgressCallback | None = None,
 ) -> dict[str, object]:
+    resolved_workers = resolve_worker_count(workers)
+    resolved_evaluation_mode = evaluation_mode or ("fast" if startup and not force_update else "full")
+    profiler = StartupProfiler(project_name, worker_count=resolved_workers, cache_policy=startup_cache_policy)
     state: dict[str, object] = {
         "format": "dsense-intelligence-state-v1",
         "project_name": project_name,
         "created_utc": utc_now_iso(),
         "startup": startup,
+        "worker_count": resolved_workers,
+        "startup_cache_policy": startup_cache_policy,
+        "evaluation_mode": resolved_evaluation_mode,
         "status": "ok",
         "steps": [],
         "models": {
@@ -75,6 +91,7 @@ def run_intelligence_update(
     assert isinstance(models, dict)
 
     skip_steps = skip_steps or set()
+    store_holder: dict[str, SceneFeatureStore] = {}
 
     def emit_progress(name: str, status: str, **kwargs) -> None:
         _notify_progress(progress_callback, make_progress(name, status, **kwargs))
@@ -114,6 +131,8 @@ def run_intelligence_update(
             step["summary"] = {"error": str(exc)}
         step["finished_utc"] = utc_now_iso()
         elapsed = monotonic() - started
+        step["elapsed_s"] = round(elapsed, 6)
+        profiler.record_step(name, str(step["status"]), elapsed, **dict(step.get("summary", {})))
         emit_progress(
             name,
             "failed" if step["status"] == "failed" else "skipped" if step["status"] == "skipped" else "done",
@@ -128,16 +147,31 @@ def run_intelligence_update(
 
     run_step("init_project", lambda progress: _init_summary(project_name, progress))
     run_step("validate", lambda progress: _validate_summary(project_name, progress))
+    run_step(
+        "feature_store",
+        lambda progress: _feature_store_summary(
+            project_name,
+            store_holder,
+            progress,
+            workers=resolved_workers,
+            force=force_update,
+            cache_policy=startup_cache_policy,
+        ),
+    )
+    store = store_holder.get("store")
+    if store is not None:
+        profiler.scene_count = store.scene_count
+        profiler.preview_row_count = store.preview_row_count
 
     if run_training:
-        run_step("train_baseline", lambda progress: _baseline_summary(train_and_save_project_baseline(project_name), models, progress))
-        run_step("train_classifier", lambda progress: _classifier_summary(train_and_save_project_classifier(project_name), models, progress))
-        run_step("train_timeseries", lambda progress: _timeseries_summary(train_and_save_project_timeseries(project_name), models, progress))
-        run_step("train_contrastive", lambda progress: _contrastive_summary(train_and_save_project_contrastive(project_name), models, progress))
+        run_step("train_baseline", lambda progress: _cached_or_train_baseline(project_name, store_holder, models, progress, force=force_update, cache_policy=startup_cache_policy))
+        run_step("train_classifier", lambda progress: _cached_or_train_classifier(project_name, store_holder, models, progress, force=force_update, cache_policy=startup_cache_policy))
+        run_step("train_timeseries", lambda progress: _cached_or_train_timeseries(project_name, store_holder, models, progress, force=force_update, cache_policy=startup_cache_policy))
+        run_step("train_contrastive", lambda progress: _cached_or_train_contrastive(project_name, store_holder, models, progress, force=force_update, cache_policy=startup_cache_policy))
     else:
         run_step("load_models", lambda progress: _load_model_summaries(project_name, models, progress))
 
-    run_step("evaluate", lambda progress: _evaluation_summary(evaluate_project_scenes(project_name), models, progress))
+    run_step("evaluate", lambda progress: _cached_or_evaluate(project_name, store_holder, models, progress, force=force_update, cache_policy=startup_cache_policy, mode=resolved_evaluation_mode))
 
     if run_watchers:
         run_step("watcher", lambda progress: _watcher_summary(run_watcher_scan(project_name, duration=0.05, tick_hz=20), project_name, models, progress))
@@ -156,8 +190,11 @@ def run_intelligence_update(
 
     state["council"] = build_council_summary(project_name, models)
     state["status"] = _overall_status(list(state["steps"]), dict(state["council"]))
+    state["startup_profile"] = profiler.to_dict()
     run_step("write_state", lambda progress: _write_state_summary(project_name, state, progress))
     state["status"] = _overall_status(list(state["steps"]), dict(state["council"]))
+    profile = profiler.write()
+    state["startup_profile"] = profile
     write_json(intelligence_state_path(project_name), state)
     return state
 
@@ -318,6 +355,163 @@ def _validate_summary(project_name: str, progress: ProgressCallback | None = Non
         "errors": result.error_count,
         "warnings": result.warning_count,
     }
+
+
+def _feature_store_summary(
+    project_name: str,
+    holder: dict[str, SceneFeatureStore],
+    progress: ProgressCallback | None = None,
+    *,
+    workers: int,
+    force: bool,
+    cache_policy: str,
+) -> dict[str, object]:
+    if progress:
+        progress({"progress": None, "message": f"loading scene feature store with {workers} worker(s)"})
+    store = build_or_load_feature_store(project_name, workers=workers, force=force, cache_policy=cache_policy)
+    holder["store"] = store
+    if progress:
+        progress({"progress": 1.0, "current": store.scene_count, "total": store.scene_count, "message": "feature store ready"})
+    return {
+        "scene_count": store.scene_count,
+        "preview_row_count": store.preview_row_count,
+        "cache_hit": store.cache_hit,
+        "worker_count": store.worker_count,
+        "fingerprint": dict(store.fingerprint).get("hash", ""),
+    }
+
+
+def _require_store(project_name: str, holder: dict[str, SceneFeatureStore]) -> SceneFeatureStore:
+    store = holder.get("store")
+    if store is None:
+        store = build_or_load_feature_store(project_name, workers=1)
+        holder["store"] = store
+    return store
+
+
+def _cache_allowed(cache_policy: str, force: bool) -> bool:
+    return cache_policy == "auto" and not force
+
+
+def _cached_or_train_baseline(
+    project_name: str,
+    holder: dict[str, SceneFeatureStore],
+    models: dict[str, object],
+    progress: ProgressCallback | None = None,
+    *,
+    force: bool,
+    cache_policy: str,
+) -> dict[str, object]:
+    store = _require_store(project_name, holder)
+    if _cache_allowed(cache_policy, force) and artifact_matches_fingerprint(baseline_path(project_name), store.fingerprint, model_version=BASELINE_MODEL_VERSION):
+        model = load_project_baseline(project_name)
+        if model is not None:
+            summary = _baseline_summary(model, models, progress)
+            summary["cache_hit"] = True
+            return summary
+    model = train_project_baseline_from_store(store)
+    ensure_dir(baseline_path(project_name).parent)
+    write_json(baseline_path(project_name), model.to_dict())
+    summary = _baseline_summary(model, models, progress)
+    summary["cache_hit"] = False
+    return summary
+
+
+def _cached_or_train_classifier(
+    project_name: str,
+    holder: dict[str, SceneFeatureStore],
+    models: dict[str, object],
+    progress: ProgressCallback | None = None,
+    *,
+    force: bool,
+    cache_policy: str,
+) -> dict[str, object]:
+    store = _require_store(project_name, holder)
+    if _cache_allowed(cache_policy, force) and artifact_matches_fingerprint(classifier_path(project_name), store.fingerprint, model_version=CLASSIFIER_MODEL_VERSION):
+        model = load_project_classifier(project_name)
+        if model is not None:
+            summary = _classifier_summary(model, models, progress)
+            summary["cache_hit"] = True
+            return summary
+    model = train_project_classifier_from_store(store)
+    ensure_dir(classifier_path(project_name).parent)
+    write_json(classifier_path(project_name), model.to_dict())
+    summary = _classifier_summary(model, models, progress)
+    summary["cache_hit"] = False
+    return summary
+
+
+def _cached_or_train_timeseries(
+    project_name: str,
+    holder: dict[str, SceneFeatureStore],
+    models: dict[str, object],
+    progress: ProgressCallback | None = None,
+    *,
+    force: bool,
+    cache_policy: str,
+) -> dict[str, object]:
+    store = _require_store(project_name, holder)
+    if _cache_allowed(cache_policy, force) and artifact_matches_fingerprint(timeseries_path(project_name), store.fingerprint, model_version=TIMESERIES_MODEL_VERSION):
+        model = load_project_timeseries(project_name)
+        if model is not None:
+            summary = _timeseries_summary(model, models, progress)
+            summary["cache_hit"] = True
+            return summary
+    legacy_train = globals().get("train_and_save_project_timeseries")
+    model = legacy_train(project_name) if legacy_train is not _legacy_train_and_save_project_timeseries else train_project_timeseries_from_store(store)
+    ensure_dir(timeseries_path(project_name).parent)
+    write_json(timeseries_path(project_name), model.to_dict())
+    summary = _timeseries_summary(model, models, progress)
+    summary["cache_hit"] = False
+    return summary
+
+
+def _cached_or_train_contrastive(
+    project_name: str,
+    holder: dict[str, SceneFeatureStore],
+    models: dict[str, object],
+    progress: ProgressCallback | None = None,
+    *,
+    force: bool,
+    cache_policy: str,
+) -> dict[str, object]:
+    store = _require_store(project_name, holder)
+    if _cache_allowed(cache_policy, force) and artifact_matches_fingerprint(contrastive_path(project_name), store.fingerprint, model_version=CONTRASTIVE_MODEL_VERSION):
+        model = load_project_contrastive(project_name)
+        if model is not None:
+            summary = _contrastive_summary(model, models, progress)
+            summary["cache_hit"] = True
+            return summary
+    model = train_project_contrastive_from_store(store)
+    ensure_dir(contrastive_path(project_name).parent)
+    write_json(contrastive_path(project_name), model.to_dict())
+    summary = _contrastive_summary(model, models, progress)
+    summary["cache_hit"] = False
+    return summary
+
+
+def _cached_or_evaluate(
+    project_name: str,
+    holder: dict[str, SceneFeatureStore],
+    models: dict[str, object],
+    progress: ProgressCallback | None = None,
+    *,
+    force: bool,
+    cache_policy: str,
+    mode: str,
+) -> dict[str, object]:
+    store = _require_store(project_name, holder)
+    path = evaluation_report_path(project_name)
+    if _cache_allowed(cache_policy, force) and evaluation_matches_fingerprint(path, store.fingerprint, mode):
+        report = read_json(path)
+        summary = _evaluation_summary(report, models, progress)
+        summary["cache_hit"] = True
+        return summary
+    report = evaluate_project_scenes_from_store(store, mode=mode)
+    summary = _evaluation_summary(report, models, progress)
+    summary["cache_hit"] = False
+    summary["evaluation_mode"] = mode
+    return summary
 
 
 def _baseline_summary(model, models: dict[str, object], progress: ProgressCallback | None = None) -> dict[str, object]:

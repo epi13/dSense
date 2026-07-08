@@ -6,7 +6,8 @@ from pathlib import Path
 
 from dsense.contrastive import extract_contrastive_features, label_to_scene_family
 from dsense.manifest import project_path
-from dsense.models.features import FEATURE_STATS, feature_distance, mean_profile, read_numeric_preview_rows, summarize_preview
+from dsense.models.features import FEATURE_STATS, feature_distance, mean_profile, read_numeric_preview_rows
+from dsense.models.scene_store import SceneFeatureStore, build_or_load_feature_store, evaluation_matches_fingerprint
 from dsense.utils.files import ensure_dir, read_json, write_json
 from dsense.utils.timebase import utc_now_iso
 
@@ -24,54 +25,59 @@ def evaluation_report_path(project_name: str) -> Path:
     return project_path(project_name) / "exports" / "evaluation_report.json"
 
 
-def evaluate_project_scenes(project_name: str, out_path: Path | None = None) -> dict[str, object]:
-    samples = load_scene_samples(project_name)
+def evaluate_project_scenes(project_name: str, out_path: Path | None = None, *, mode: str = "full", force: bool = False) -> dict[str, object]:
+    store = build_or_load_feature_store(project_name, workers=1)
+    out = out_path or evaluation_report_path(project_name)
+    if not force and evaluation_matches_fingerprint(out, store.fingerprint, mode):
+        return read_json(out)
+    return evaluate_project_scenes_from_store(store, out_path=out_path, mode=mode)
+
+
+def evaluate_project_scenes_from_store(store: SceneFeatureStore, out_path: Path | None = None, *, mode: str = "full") -> dict[str, object]:
+    mode = mode if mode in {"full", "fast", "sampled"} else "full"
+    samples = load_scene_samples_from_store(store)
     label_counts = _label_counts(samples)
     report = {
         "format": "dsense-evaluation-v1",
-        "project_name": project_name,
+        "project_name": store.project_name,
         "created_utc": utc_now_iso(),
+        "evaluation_mode": mode,
+        "dataset_fingerprint": store.fingerprint,
         "scene_count": len(samples),
         "label_counts": label_counts,
-        "within_label_similarity": _within_label_similarity(samples),
-        "between_label_distance": _between_label_distance(samples),
+        "within_label_similarity": _within_label_similarity(samples, mode=mode),
+        "between_label_distance": _between_label_distance(samples, mode=mode),
         "confusion_matrix": _leave_one_out_confusion(samples),
         "baseline_drift": _baseline_drift(samples),
         "channel_usefulness_ranking": _channel_usefulness(samples),
         "label_distance_matrix": _label_distance_matrix(samples),
-        "contrastive_evaluation": _contrastive_evaluation(samples),
+        "contrastive_evaluation": _contrastive_evaluation(samples, store=store, mode=mode),
     }
     report["answers"] = _research_answers(report)
-    out = out_path or evaluation_report_path(project_name)
+    out = out_path or evaluation_report_path(store.project_name)
     ensure_dir(out.parent)
     write_json(out, report)
     return report
 
 
 def load_scene_samples(project_name: str) -> list[SceneSample]:
-    samples: list[SceneSample] = []
-    root = project_path(project_name)
-    for scene_path in sorted((root / "scenes").glob("scene_*/scene.json")):
-        try:
-            scene = read_json(scene_path)
-        except (OSError, ValueError):
-            continue
-        if scene.get("accepted") is False:
-            continue
-        preview_path = scene_path.parent / "preview.csv"
-        if not preview_path.exists():
-            continue
-        features = summarize_preview(preview_path)
-        if not features:
-            continue
-        samples.append(SceneSample(
-            scene_id=str(scene.get("scene_id", scene_path.parent.name)),
-            label=str(scene.get("label", "unknown")),
-            created_utc=str(scene.get("created_utc", "")),
-            scene_dir=scene_path.parent,
-            features=features,
-        ))
-    return samples
+    store = build_or_load_feature_store(project_name, workers=1)
+    return load_scene_samples_from_store(store)
+
+
+def load_scene_samples_from_store(store: SceneFeatureStore) -> list[SceneSample]:
+    root = project_path(store.project_name)
+    return [
+        SceneSample(
+            scene_id=scene.scene_id,
+            label=scene.label,
+            created_utc=scene.created_utc,
+            scene_dir=root / scene.scene_dir,
+            features=scene.summary_features,
+        )
+        for scene in store.accepted_scenes
+        if scene.summary_features
+    ]
 
 
 def predict_from_profiles(label_profiles: dict[str, dict[str, float]], features: dict[str, float]) -> dict[str, object]:
@@ -134,13 +140,22 @@ def _label_counts(samples: list[SceneSample]) -> dict[str, int]:
     return counts
 
 
-def _contrastive_evaluation(samples: list[SceneSample]) -> dict[str, object]:
-    contrastive_samples = []
-    for sample in samples:
-        rows = read_numeric_preview_rows(sample.scene_dir / "preview.csv")
-        features = extract_contrastive_features(rows) if rows else {}
-        if features:
-            contrastive_samples.append((sample, label_to_scene_family(sample.label), features))
+def _contrastive_evaluation(samples: list[SceneSample], *, store: SceneFeatureStore | None = None, mode: str = "full") -> dict[str, object]:
+    if store is not None:
+        by_id = {scene.scene_id: scene for scene in store.accepted_scenes}
+        contrastive_samples = [
+            (sample, label_to_scene_family(sample.label), by_id[sample.scene_id].contrastive_features)
+            for sample in samples
+            if sample.scene_id in by_id and by_id[sample.scene_id].contrastive_features
+        ]
+    else:
+        contrastive_samples = []
+        for sample in samples:
+            rows = read_numeric_preview_rows(sample.scene_dir / "preview.csv")
+            features = extract_contrastive_features(rows) if rows else {}
+            if features:
+                contrastive_samples.append((sample, label_to_scene_family(sample.label), features))
+    contrastive_samples = _limit_sequence(contrastive_samples, _mode_sample_limit(mode))
     family_matrix: dict[str, dict[str, int]] = {}
     label_matrix: dict[str, dict[str, int]] = {}
     low_confidence: list[dict[str, object]] = []
@@ -212,12 +227,13 @@ def _nearest_profile(profiles: dict[str, dict[str, float]], features: dict[str, 
     return {"label": label, "confidence": round(max(0.0, min(confidence, 0.85)), 3), "distance": round(distance, 6)}
 
 
-def _within_label_similarity(samples: list[SceneSample]) -> dict[str, object]:
+def _within_label_similarity(samples: list[SceneSample], *, mode: str = "full") -> dict[str, object]:
     by_label = _samples_by_label(samples)
     label_scores: dict[str, float] = {}
     all_scores: list[float] = []
+    pair_cap = _mode_pair_cap(mode)
     for label, label_samples in by_label.items():
-        distances = [_distance(a, b) for a, b in combinations(label_samples, 2)]
+        distances = [_distance(a, b) for a, b in _limited_pairs(label_samples, pair_cap)]
         if distances:
             similarity = sum(1.0 / (1.0 + distance) for distance in distances) / len(distances)
             label_scores[label] = round(similarity, 6)
@@ -225,10 +241,11 @@ def _within_label_similarity(samples: list[SceneSample]) -> dict[str, object]:
     return {"overall": round(sum(all_scores) / len(all_scores), 6) if all_scores else 0.0, "labels": label_scores}
 
 
-def _between_label_distance(samples: list[SceneSample]) -> dict[str, object]:
+def _between_label_distance(samples: list[SceneSample], *, mode: str = "full") -> dict[str, object]:
+    pair_cap = _mode_pair_cap(mode)
     distances = [
         _distance(left, right)
-        for left, right in combinations(samples, 2)
+        for left, right in _limited_pairs(samples, pair_cap)
         if left.label != right.label
     ]
     return {
@@ -251,15 +268,18 @@ def _label_distance_matrix(samples: list[SceneSample]) -> dict[str, dict[str, fl
 
 
 def _leave_one_out_confusion(samples: list[SceneSample]) -> dict[str, object]:
+    sums: dict[str, dict[str, float]] = {}
+    counts: dict[str, int] = {}
+    for sample in samples:
+        counts[sample.label] = counts.get(sample.label, 0) + 1
+        bucket = sums.setdefault(sample.label, {})
+        for key, value in sample.features.items():
+            bucket[key] = bucket.get(key, 0.0) + float(value)
     matrix: dict[str, dict[str, int]] = {}
     correct = 0
     evaluated = 0
     for holdout in samples:
-        training = [sample for sample in samples if sample.scene_id != holdout.scene_id]
-        profiles = {
-            label: mean_profile([sample.features for sample in label_samples])
-            for label, label_samples in _samples_by_label(training).items()
-        }
+        profiles = _loo_profiles(sums, counts, holdout)
         prediction = predict_from_profiles(profiles, holdout.features)
         predicted = str(prediction["label"])
         matrix.setdefault(holdout.label, {})
@@ -272,6 +292,22 @@ def _leave_one_out_confusion(samples: list[SceneSample]) -> dict[str, object]:
         "evaluated": evaluated,
         "matrix": matrix,
     }
+
+
+def _loo_profiles(sums: dict[str, dict[str, float]], counts: dict[str, int], holdout: SceneSample) -> dict[str, dict[str, float]]:
+    profiles: dict[str, dict[str, float]] = {}
+    for label, total_by_feature in sums.items():
+        count = counts.get(label, 0)
+        if label == holdout.label:
+            count -= 1
+        if count <= 0:
+            continue
+        profile: dict[str, float] = {}
+        for key, total in total_by_feature.items():
+            value = total - float(holdout.features.get(key, 0.0)) if label == holdout.label else total
+            profile[key] = value / count
+        profiles[label] = profile
+    return profiles
 
 
 def _baseline_drift(samples: list[SceneSample]) -> dict[str, object]:
@@ -455,3 +491,40 @@ def _fmt(value: object) -> str:
     if isinstance(value, (int, float)):
         return f"{float(value):.3f}"
     return "n/a"
+
+
+def _mode_pair_cap(mode: str) -> int | None:
+    if mode == "full":
+        return None
+    if mode == "fast":
+        return 400
+    return 200
+
+
+def _mode_sample_limit(mode: str) -> int | None:
+    if mode == "full":
+        return None
+    if mode == "fast":
+        return 120
+    return 60
+
+
+def _limited_pairs(samples: list[SceneSample], limit: int | None):
+    pairs = combinations(samples, 2)
+    if limit is None:
+        return list(pairs)
+    out = []
+    for index, pair in enumerate(pairs):
+        if index >= limit:
+            break
+        out.append(pair)
+    return out
+
+
+def _limit_sequence(values, limit: int | None):
+    if limit is None or len(values) <= limit:
+        return values
+    if limit <= 0:
+        return []
+    step = max(1, len(values) // limit)
+    return values[::step][:limit]

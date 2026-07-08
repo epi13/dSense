@@ -9,10 +9,12 @@ from statistics import median
 
 from .manifest import project_path
 from .models.features import feature_distance, feature_manifest, mean_profile, read_numeric_preview_rows, slope, variance
+from .models.scene_store import SceneFeatureStore, build_or_load_feature_store, feature_manifest_from_store
 from .utils.files import ensure_dir, read_json, write_json
 from .utils.timebase import utc_now_iso
 
 CONTRASTIVE_FORMAT = "dsense-contrastive-model-v1"
+CONTRASTIVE_MODEL_VERSION = "contrastive-profile-v2"
 TCN_WEIGHTS_NAME = "contrastive_tcn.pt"
 TCN_BACKENDS = {"torch_tcn", "tcn"}
 
@@ -65,7 +67,20 @@ def train_project_contrastive(project_name: str, backend: str = "profile") -> Co
         return _train_torch_tcn_or_fallback(project_name, normalized_backend)
     if normalized_backend != "profile":
         raise ValueError(f"Unknown contrastive backend: {backend}")
-    return _train_profile(project_name, backend="profile")
+    store = build_or_load_feature_store(project_name, workers=1, model_options={"contrastive_backend": "profile"})
+    return train_project_contrastive_from_store(store, backend="profile")
+
+
+def train_project_contrastive_from_store(store: SceneFeatureStore, backend: str = "profile") -> ContrastiveTemporalModel:
+    normalized_backend = _normalize_backend(backend)
+    if normalized_backend != "profile":
+        return train_project_contrastive(store.project_name, backend=backend)
+    examples = [
+        _SceneExample(scene.scene_id, scene.label, scene_family(scene.label), scene.preview_rows, scene.contrastive_features or extract_contrastive_features(scene.preview_rows))
+        for scene in store.accepted_scenes
+        if scene.preview_rows
+    ]
+    return _train_profile_from_examples(store.project_name, examples, backend="profile", store=store)
 
 
 def train_and_save_project_contrastive(project_name: str, backend: str = "profile") -> ContrastiveTemporalModel:
@@ -189,6 +204,17 @@ def label_to_scene_family(label: str) -> str:
 
 def _train_profile(project_name: str, *, backend: str, warnings: list[str] | None = None) -> ContrastiveTemporalModel:
     examples = _load_examples(project_name)
+    return _train_profile_from_examples(project_name, examples, backend=backend, warnings=warnings)
+
+
+def _train_profile_from_examples(
+    project_name: str,
+    examples: list[_SceneExample],
+    *,
+    backend: str,
+    warnings: list[str] | None = None,
+    store: SceneFeatureStore | None = None,
+) -> ContrastiveTemporalModel:
     label_features: dict[str, list[dict[str, float]]] = {}
     family_features: dict[str, list[dict[str, float]]] = {}
     label_counts: dict[str, int] = {}
@@ -206,7 +232,10 @@ def _train_profile(project_name: str, *, backend: str, warnings: list[str] | Non
         all_rows.extend(example.rows)
         sequence_channels.update({channel for row in example.rows for channel in row})
 
-    manifest = feature_manifest(all_features, all_rows)
+    manifest = feature_manifest_from_store(store, "contrastive_features") if store is not None else feature_manifest(all_features, all_rows)
+    if store is not None:
+        manifest["dataset_fingerprint"] = store.fingerprint
+    manifest["model_version"] = CONTRASTIVE_MODEL_VERSION if backend == "profile" else f"contrastive-{backend}-v2"
     manifest["contrastive_stats"] = [
         "first",
         "last",

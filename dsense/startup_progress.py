@@ -28,6 +28,7 @@ class StartupStepProgress:
 STEP_LABELS = {
     "init_project": "Project Init",
     "validate": "Validation",
+    "feature_store": "Feature Store",
     "train_baseline": "Baseline",
     "train_classifier": "Classifier",
     "train_timeseries": "Time-series",

@@ -68,6 +68,7 @@ def record_scene(scene_dir: Path, scene_id: str, label: str, duration: float, ti
     preview_fields = {"tick", "t_ns", "dt_ns", "sleep_drift_ns", "process_ns_estimate", "quality_flags", "channel_sampled_mask", "channel_stale_mask", "channel_unavailable_mask"}
     user_events: list[dict[str, object]] = []
     frames_path = scene_dir / "frames.ds64"
+    frames_sha = hashlib.sha256()
     start_ns = monotonic_ns()
     next_target = start_ns
     action_start_ms = int(pre_roll * 1000)
@@ -87,6 +88,7 @@ def record_scene(scene_dir: Path, scene_id: str, label: str, duration: float, ti
                     quality |= RAW_OVERFLOW_QUALITY_MASK
                 frame = build_frame(tick, now, availability, quality, vals.get("dt_ns", 0), vals.get("sleep_drift_ns", 0), vals.get("process_ns_estimate", 0))
                 fh.write(frame)
+                frames_sha.update(frame)
                 row = {
                     "tick": tick,
                     "t_ns": now,
@@ -143,7 +145,7 @@ def record_scene(scene_dir: Path, scene_id: str, label: str, duration: float, ti
     events = sorted(events, key=lambda e: (int(e.get("t_ms", 0)), e.get("event") == "scene_end"))
     (scene_dir / "events.jsonl").write_text("".join(json.dumps(e, sort_keys=True) + "\n" for e in events), encoding="utf-8")
     (scene_dir / "notes.txt").write_text(notes + ("\n" if notes else ""), encoding="utf-8")
-    sha = hashlib.sha256(frames_path.read_bytes()).hexdigest()
+    sha = frames_sha.hexdigest()
     (scene_dir / "checksum.txt").write_text(f"sha256  frames.ds64  {sha}\nframe_size_bytes  {FRAME_SIZE}\n", encoding="utf-8")
     quality_summary = summarize_frames(frames_path, expected, interval_ns).to_dict()
     scene = {"scene_id": scene_id, "label": label, "created_utc": utc_now_iso(), "duration_ms": duration_ms, "tick_hz": tick_hz,

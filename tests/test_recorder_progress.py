@@ -37,6 +37,24 @@ def test_record_scene_progress_callback_can_add_events(tmp_path):
     assert not [error for error in validate_scene(tmp_path / "scene_000001").errors if error.field == "events"]
 
 
+def test_record_scene_checksum_does_not_read_frames_back(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    original_read_bytes = Path.read_bytes
+
+    def guarded_read_bytes(path):
+        if str(path).endswith("frames.ds64"):
+            raise AssertionError("frames.ds64 should be hashed while writing")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
+
+    scene = record_scene(tmp_path / "scene_000001", "scene_000001", "checksum_test", duration=0.03, tick_hz=10)
+
+    assert scene["quality"]["checksum_ok"] is True
+    assert "sha256  frames.ds64" in (tmp_path / "scene_000001" / "checksum.txt").read_text(encoding="utf-8")
+
+
 def test_record_scene_progress_callback_receives_telemetry_snapshot(tmp_path, monkeypatch):
     class SlowChannel:
         id = "slow"

@@ -6,10 +6,12 @@ from pathlib import Path
 
 from .manifest import project_path
 from .models.features import feature_manifest, full_profile, percentile, read_numeric_preview_rows, summarize_rows
+from .models.scene_store import SceneFeatureStore, build_or_load_feature_store, feature_manifest_from_store
 from .utils.files import ensure_dir, read_json, write_json
 from .utils.timebase import utc_now_iso
 
 BASELINE_CHANNELS = ("dt_ns", "sleep_drift_ns", "process_ns_estimate")
+BASELINE_MODEL_VERSION = "baseline-profile-v2"
 
 
 @dataclass(frozen=True)
@@ -37,25 +39,22 @@ def baseline_path(project_name: str) -> Path:
 
 
 def train_project_baseline(project_name: str, threshold: float = 6.0) -> BaselineModel:
-    root = project_path(project_name)
+    store = build_or_load_feature_store(project_name, workers=1)
+    return train_project_baseline_from_store(store, threshold=threshold)
+
+
+def train_project_baseline_from_store(store: SceneFeatureStore, threshold: float = 6.0) -> BaselineModel:
     values: dict[str, list[float]] = {}
     all_features: list[dict[str, float]] = []
     all_rows: list[dict[str, float]] = []
     scene_count = 0
-    for scene_path in sorted((root / "scenes").glob("scene_*/scene.json")):
-        try:
-            scene = read_json(scene_path)
-        except (OSError, ValueError):
+    for scene in store.accepted_scenes:
+        if not scene.label.startswith("baseline_"):
             continue
-        if scene.get("accepted") is False or not str(scene.get("label", "")).startswith("baseline_"):
-            continue
-        preview = scene_path.parent / "preview.csv"
-        if not preview.exists():
-            continue
-        rows = _read_rows(preview)
+        rows = scene.preview_rows
         if not rows:
             continue
-        all_features.append(summarize_rows(rows))
+        all_features.append(scene.summary_features or summarize_rows(rows))
         all_rows.extend(rows)
         scene_count += 1
         for row in rows:
@@ -67,7 +66,12 @@ def train_project_baseline(project_name: str, threshold: float = 6.0) -> Baselin
         for channel, channel_values in values.items()
         if channel_values
     }
-    return BaselineModel(project_name, utc_now_iso(), scene_count, threshold, channels, feature_manifest(all_features, all_rows))
+    manifest = feature_manifest_from_store(store)
+    if not manifest.get("features"):
+        manifest = feature_manifest(all_features, all_rows)
+    manifest["model_version"] = BASELINE_MODEL_VERSION
+    manifest["dataset_fingerprint"] = store.fingerprint
+    return BaselineModel(store.project_name, utc_now_iso(), scene_count, threshold, channels, manifest)
 
 
 def train_and_save_project_baseline(project_name: str, threshold: float = 6.0) -> BaselineModel:

@@ -94,6 +94,21 @@ def test_tui_state_dataclasses_hold_runtime_state():
     assert app_state.recording.latest["tick"] == 1
 
 
+def test_tui_scene_keep_updates_one_scene_without_full_reload(monkeypatch):
+    app = SceneRecorderTUI.__new__(SceneRecorderTUI)
+    app.scenes = [{"scene_id": "scene_000001", "label": "old"}, {"scene_id": "scene_000002", "label": "old2"}]
+    app.scene_index = 0
+
+    monkeypatch.setattr("dsense.tui.load_project_scenes", lambda project_name: (_ for _ in ()).throw(AssertionError("full reload should be lazy")))
+
+    app._upsert_scene({"scene_id": "scene_000002", "label": "new"})
+    app._upsert_scene({"scene_id": "scene_000003", "label": "added"})
+
+    assert [scene["scene_id"] for scene in app.scenes] == ["scene_000001", "scene_000002", "scene_000003"]
+    assert app.scenes[1]["label"] == "new"
+    assert app.scene_index == 2
+
+
 def test_tui_job_manager_runs_and_logs_jobs(tmp_path, monkeypatch):
     import time
 
@@ -181,11 +196,16 @@ def test_live_cli_parser_accepts_live_and_start_tabs():
 
 def test_startup_performance_flags_parse():
     parser = build_parser()
-    fast = parser.parse_args(["tui", "base", "--fast-start"])
+    fast = parser.parse_args(["tui", "base", "--fast-start", "--workers", "4", "--startup-cache-policy", "rebuild", "--startup-mode", "full", "--evaluation-mode", "sampled", "--profile-startup"])
     force = parser.parse_args(["tui", "base", "--force-startup-update", "--no-startup-orbiters"])
     alias = parser.parse_args(["tui-fast", "base"])
 
     assert fast.fast_start is True
+    assert fast.workers == 4
+    assert fast.startup_cache_policy == "rebuild"
+    assert fast.startup_mode == "full"
+    assert fast.evaluation_mode == "sampled"
+    assert fast.profile_startup is True
     assert force.force_startup_update is True
     assert force.no_startup_orbiters is True
     assert alias.project_name == "base"

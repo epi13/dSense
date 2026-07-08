@@ -39,6 +39,11 @@ class CaptureConfig:
     start_tab: str = "live"
     fast_start: bool = False
     force_startup_update: bool = False
+    startup_mode: str = "balanced"
+    startup_cache_policy: str = "auto"
+    evaluation_mode: str = "fast"
+    workers: int | None = None
+    profile_startup: bool = False
 
 
 @dataclass

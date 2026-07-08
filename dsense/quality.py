@@ -24,9 +24,9 @@ class QualitySummary:
 
 
 def summarize_frames(frames_path: Path, expected_frames: int, target_interval_ns: int) -> QualitySummary:
-    data = frames_path.read_bytes() if frames_path.exists() else b""
-    frame_size_valid = len(data) % FRAME_SIZE == 0
-    frames = [data[i:i + FRAME_SIZE] for i in range(0, len(data), FRAME_SIZE)] if frame_size_valid else []
+    data_len = frames_path.stat().st_size if frames_path.exists() else 0
+    frame_size_valid = data_len % FRAME_SIZE == 0
+    frames = _read_frames(frames_path) if frame_size_valid else []
     checks = [verify_frame(f) for f in frames]
     parsed = [parse_frame(f) for f, ok in zip(frames, checks) if ok]
     dts = [p.dt_ns for p in parsed if p.dt_ns > 0]
@@ -45,3 +45,16 @@ def summarize_frames(frames_path: Path, expected_frames: int, target_interval_ns
     confidence = round((frame_score * 0.45 + jitter_score * 0.35 + checksum_score * 0.20), 3)
     return QualitySummary(expected_frames, len(frames), frame_size_valid, dropped, avg, mn, mx, jitter,
                           all(checks) and frame_size_valid, availability, confidence)
+
+
+def _read_frames(frames_path: Path) -> list[bytes]:
+    frames: list[bytes] = []
+    if not frames_path.exists():
+        return frames
+    with frames_path.open("rb") as handle:
+        while True:
+            frame = handle.read(FRAME_SIZE)
+            if not frame:
+                break
+            frames.append(frame)
+    return frames

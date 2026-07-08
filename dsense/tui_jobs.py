@@ -182,6 +182,10 @@ def update_intelligence_job(
     run_orbiters: bool = True,
     run_training: bool = True,
     run_transfer: bool = True,
+    workers: int | None = None,
+    startup_cache_policy: str = "auto",
+    evaluation_mode: str | None = None,
+    startup: bool = False,
     status_callback: Callable[[str], None] | None = None,
 ) -> str:
     latest = ""
@@ -195,11 +199,14 @@ def update_intelligence_job(
 
     state = run_intelligence_update(
         project_name,
-        startup=False,
+        startup=startup,
         run_watchers=run_watchers,
         run_orbiters=run_orbiters,
         run_training=run_training,
         run_transfer=run_transfer,
+        workers=workers,
+        startup_cache_policy=startup_cache_policy,
+        evaluation_mode=evaluation_mode,
         progress_callback=progress,
     )
     council = dict(state.get("council", {}))

@@ -7,8 +7,11 @@ from statistics import median
 from .manifest import project_path
 from .models.evaluation import predict_from_profiles
 from .models.features import feature_distance, feature_manifest, mean_profile, read_numeric_preview_rows, slope, variance
+from .models.scene_store import SceneFeatureStore, build_or_load_feature_store, feature_manifest_from_store
 from .utils.files import ensure_dir, read_json, write_json
 from .utils.timebase import utc_now_iso
+
+TIMESERIES_MODEL_VERSION = "timeseries-profile-v2"
 
 
 @dataclass(frozen=True)
@@ -39,7 +42,11 @@ def timeseries_path(project_name: str) -> Path:
 
 
 def train_project_timeseries(project_name: str) -> TimeSeriesModel:
-    root = project_path(project_name)
+    store = build_or_load_feature_store(project_name, workers=1)
+    return train_project_timeseries_from_store(store)
+
+
+def train_project_timeseries_from_store(store: SceneFeatureStore) -> TimeSeriesModel:
     label_counts: dict[str, int] = {}
     label_features: dict[str, list[dict[str, float]]] = {}
     all_features: list[dict[str, float]] = []
@@ -47,21 +54,12 @@ def train_project_timeseries(project_name: str) -> TimeSeriesModel:
     sequence_channels: set[str] = set()
     scene_count = 0
 
-    for scene_path in sorted((root / "scenes").glob("scene_*/scene.json")):
-        try:
-            scene = read_json(scene_path)
-        except (OSError, ValueError):
-            continue
-        if scene.get("accepted") is False:
-            continue
-        preview_path = scene_path.parent / "preview.csv"
-        if not preview_path.exists():
-            continue
-        rows = read_numeric_preview_rows(preview_path)
+    for scene in store.accepted_scenes:
+        rows = scene.preview_rows
         if not rows:
             continue
-        label = str(scene.get("label", "unknown"))
-        features = extract_timeseries_features(rows)
+        label = scene.label
+        features = scene.timeseries_features or extract_timeseries_features(rows)
         if not features:
             continue
         scene_count += 1
@@ -72,7 +70,11 @@ def train_project_timeseries(project_name: str) -> TimeSeriesModel:
         label_features.setdefault(label, []).append(features)
 
     profiles = {label: mean_profile(features) for label, features in label_features.items()}
-    manifest = feature_manifest(all_features, all_rows)
+    manifest = feature_manifest_from_store(store, "timeseries_features")
+    if not manifest.get("features"):
+        manifest = feature_manifest(all_features, all_rows)
+    manifest["model_version"] = TIMESERIES_MODEL_VERSION
+    manifest["dataset_fingerprint"] = store.fingerprint
     manifest["timeseries_stats"] = [
         "first",
         "last",
@@ -84,7 +86,7 @@ def train_project_timeseries(project_name: str) -> TimeSeriesModel:
         "window_median",
     ]
     return TimeSeriesModel(
-        project_name=project_name,
+        project_name=store.project_name,
         trained_utc=utc_now_iso(),
         scene_count=scene_count,
         label_counts=label_counts,
